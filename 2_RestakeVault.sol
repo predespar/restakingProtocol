@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+/*─────────────── OpenZeppelin ───────────────*/
 import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
+/*─────────────── External interfaces ───────*/
 interface IWrstToken {
     function paused() external view returns (bool);
 }
 
-/**
- * @title  RestakeVault
- * @notice Stores ETH; authorised spender can withdraw for hedging, oracle
- *         reserves ETH for withdrawal claims. All outgoing transfers are
- *         blocked while wrstETH token is globally paused.
- */
+/*─────────────── RestakeVault ───────*/
 contract RestakeVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /*---------------- Roles ----------------*/
     bytes32 public constant SPENDER_ROLE = keccak256("SPENDER_ROLE");
@@ -45,10 +42,7 @@ contract RestakeVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         _;
     }
 
-    /*--------------- Outbound: hedging ----------------*/
-    /**
-     * @dev Spender withdraws free liquidity to hedge/arb on CEX/DeFi.
-     */
+    /*--------------- withdraw ----------------*/
     function withdrawToRestaker(address payable to, uint256 amount)
         external
         notPausedToken
