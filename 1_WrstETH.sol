@@ -164,7 +164,7 @@ contract WrstETH is
 		}
 	}
 
-	/*──────────────── Burn and withdrawal ─*/
+	/*──────────────── Burn for withdrawal ─*/
 	function burnForWithdrawal(address from,uint256 wrstWei)
 		external whenNotPaused onlyRole(QUEUE_ROLE)
 		returns(uint256 ethWei)
