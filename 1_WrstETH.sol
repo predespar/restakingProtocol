@@ -151,7 +151,7 @@ contract WrstETH is
 
 		uint256 ethForMint = ethByWrst(wrstWei);
 		(bool okVault, ) = address(vault).call{value: ethForMint}("");
-		require(okVault, "ETH: restaking push fail);
+		require(okVault, "ETH: restaking push fail");
 		
 		mintedTodayWei += wrstWei;
 		mintedWei = wrstWei;
