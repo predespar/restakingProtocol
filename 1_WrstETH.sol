@@ -47,6 +47,11 @@ contract WrstETH is
 
 	mapping(address => bool) private _frozen;   ///< Sanctions / fraud freeze list
 
+	/* ---------- pending addresses for two-phase role rotation ---------- */
+	address public pendingAdmin;
+	address public pendingFreezer;
+	address public pendingPauser;
+
 	/* ------------------------------ Events ----------------------------- */
 	event Frozen(address indexed account);
 	event Unfrozen(address indexed account);
@@ -56,8 +61,14 @@ contract WrstETH is
 	event DailyCapChanged(uint256 newDailyCapWei);
 	event RateChanged(uint256 oldRateWei, uint256 newRateWei);
 
-	event FreezerChanged(address oldFreezer, address newFreezer);
-	event PauserChanged(address oldPauser,  address newPauser);
+	event AdminProposed(  address indexed oldAdmin,   address indexed newAdmin);
+	event AdminChanged(   address indexed oldAdmin,   address indexed newAdmin);
+	
+	event FreezerProposed(address indexed oldFreezer, address indexed newFreezer);
+	event FreezerChanged( address indexed oldFreezer, address indexed newFreezer);
+	
+	event PauserProposed( address indexed oldPauser,  address indexed newPauser);
+	event PauserChanged(  address indexed oldPauser,  address indexed newPauser);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
@@ -129,17 +140,64 @@ contract WrstETH is
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
-	function setFreezer(address newFreezer) external onlyRole(DEFAULT_ADMIN_ROLE) {
-		require(newFreezer != address(0), "wrstETH: zero freezer");
-		_revokeRole(FREEZER_ROLE, getRoleMember(FREEZER_ROLE, 0));
-		_grantRole(FREEZER_ROLE,  newFreezer);
-		emit FreezerChanged(getRoleMember(FREEZER_ROLE, 0), newFreezer);
+	/* ------------------------- Two-phase: ADMIN ------------------------ */
+	function proposeAdmin(address newAdmin)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newAdmin != address(0), "wrstETH: zero admin");
+		pendingAdmin = newAdmin;
+		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
 	}
-	function setPauser(address newPauser)  external onlyRole(DEFAULT_ADMIN_ROLE) {
+	
+	function acceptAdmin() external {
+		require(msg.sender == pendingAdmin, "wrstETH: not pending admin");
+		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
+	
+		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
+		_revokeRole(DEFAULT_ADMIN_ROLE, old);
+	
+		emit AdminChanged(old, pendingAdmin);
+		pendingAdmin = address(0);
+	}
+	
+	/* ------------------------- Two-phase: FREEZER ---------------------- */
+	function proposeFreezer(address newFreezer)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newFreezer != address(0), "wrstETH: zero freezer");
+		pendingFreezer = newFreezer;
+		emit FreezerProposed(getRoleMember(FREEZER_ROLE, 0), newFreezer);
+	}
+	
+	function acceptFreezer() external {
+		require(msg.sender == pendingFreezer, "wrstETH: not pending freezer");
+		address old = getRoleMember(FREEZER_ROLE, 0);
+	
+		_grantRole(FREEZER_ROLE, pendingFreezer);
+		_revokeRole(FREEZER_ROLE, old);
+	
+		emit FreezerChanged(old, pendingFreezer);
+		pendingFreezer = address(0);
+	}
+	
+	/* ------------------------- Two-phase: PAUSER ----------------------- */
+	function proposePauser(address newPauser)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
 		require(newPauser != address(0), "wrstETH: zero pauser");
-		_revokeRole(PAUSER_ROLE, getRoleMember(PAUSER_ROLE, 0));
-		_grantRole(PAUSER_ROLE,  newPauser);
-		emit PauserChanged(getRoleMember(PAUSER_ROLE, 0), newPauser);
+		pendingPauser = newPauser;
+		emit PauserProposed(getRoleMember(PAUSER_ROLE, 0), newPauser);
+	}
+	
+	function acceptPauser() external {
+		require(msg.sender == pendingPauser, "wrstETH: not pending pauser");
+		address old = getRoleMember(PAUSER_ROLE, 0);
+	
+		_grantRole(PAUSER_ROLE, pendingPauser);
+		_revokeRole(PAUSER_ROLE, old);
+	
+		emit PauserChanged(old, pendingPauser);
+		pendingPauser = address(0);
 	}
 
 	/* --------------------------- Math helpers -------------------------- */
