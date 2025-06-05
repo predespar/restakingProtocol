@@ -7,9 +7,14 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 
+/* ──────────────────────────── External interfaces ─────────────────────────── */
+interface IWrstToken {
+	function paused() external view returns (bool);
+}
+
 /**
  * @title RestakeVault
- * @notice restaking/unrestaking manager.
+ * @notice Restaking / un-restaking manager.
  */
 contract RestakeVault is
 	AccessControlEnumerableUpgradeable,
@@ -20,22 +25,25 @@ contract RestakeVault is
 	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant RESTAKER_ROLE = keccak256("RESTAKER_ROLE");
 	bytes32 public constant ORACLE_ROLE   = keccak256("ORACLE_ROLE");
+	bytes32 public constant QUEUE_ROLE    = keccak256("QUEUE_ROLE");
 
 	/* -------------------- External contract addresses ------------------ */
-	address public wrstETHToken;   ///< wrstETH proxy (for pause checks)
+	IWrstToken public wrstETHToken;   ///< wrstETH proxy (for pause checks)
 
 	/* --------------------------- State vars ---------------------------- */
 	uint256 private _claimReserveWei;    // Reserved for queued withdrawals
 
 	/* ------------------------------ Events ----------------------------- */
-	event RestakerChanged(address oldRestaker, address newRestaker);
-	event OracleChanged(  address oldOracle,   address newOracle);
+	event RestakerChanged(address indexed oldRestaker, address indexed newRestaker);
+	event OracleChanged(  address indexed oldOracle,   address indexed newOracle);
+	event QueueChanged(   address indexed oldQueue,    address indexed newQueue);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
 		address admin,
 		address restaker,
 		address oracle,
+		address queue,
 		address wrstETHAddr
 	) external initializer {
 		__AccessControlEnumerable_init();
@@ -44,22 +52,21 @@ contract RestakeVault is
 		_grantRole(DEFAULT_ADMIN_ROLE, admin);
 		_grantRole(RESTAKER_ROLE,     restaker);
 		_grantRole(ORACLE_ROLE,       oracle);
+		_grantRole(QUEUE_ROLE,        queue);
 
-		wrstETHToken = wrstETHAddr;
+		wrstETHToken = IWrstToken(wrstETHAddr);
 	}
 
 	/* ------------------------- Modifiers ------------------------------- */
 	modifier wrstETHNotPaused() {
-		(bool ok, bytes memory data) =
-			wrstETHToken.staticcall(abi.encodeWithSignature("paused()"));
-		require(ok && data.length == 32 && !abi.decode(data, (bool)),
-				"Vault: wrstETH paused");
+		require(!wrstETHToken.paused(), "Vault: wrstETH paused");
 		_;
 	}
 
 	/* ----------------------- Liquidity outflow ------------------------- */
 	/**
-	 * @notice Move assets to restaking venue.
+	 * @notice Move assets to a restaking venue.
+	 * @param amountEthWei Amount of ETH (in wei) to withdraw.
 	 */
 	function withdrawForRestaking(uint256 amountEthWei)
 		external
@@ -68,10 +75,10 @@ contract RestakeVault is
 		onlyRole(RESTAKER_ROLE)
 	{
 		require(
-			address(this).balance - _claimReserveWei >= amountWei,
+			address(this).balance - _claimReserveWei >= amountEthWei,
 			"Vault: insufficient liquidity"
 		);
-		payable(msg.sender).sendValue(amountWei);
+		payable(msg.sender).sendValue(amountEthWei);   // reverts on failure
 	}
 
 	/* ----------------------- Liquidity inflow -------------------------- */
@@ -82,14 +89,17 @@ contract RestakeVault is
 		external onlyRole(ORACLE_ROLE)
 	{ _claimReserveWei += ethWei; }
 
+	/**
+	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
+	 */
 	function releaseClaim(address payable user, uint256 ethWei)
 		external
 		nonReentrant
 		wrstETHNotPaused
-		onlyRole(ORACLE_ROLE)
+		onlyRole(QUEUE_ROLE)
 	{
 		_claimReserveWei -= ethWei;
-		user.sendValue(ethWei);
+		user.sendValue(ethWei);                      // reverts on failure
 	}
 
 	/* ------------------------- Restricted getters ---------------------- */
@@ -109,24 +119,36 @@ contract RestakeVault is
 	function setRestaker(address newRestaker)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		require(newRestaker != address(0), "vault: zero Restaker");
-		_revokeRole(RESTAKER_ROLE, getRoleMember(RESTAKER_ROLE, 0));
+		require(newRestaker != address(0), "Vault: zero Restaker");
+		address old = getRoleMember(RESTAKER_ROLE, 0);
+		_revokeRole(RESTAKER_ROLE, old);
 		_grantRole(RESTAKER_ROLE,  newRestaker);
-		emit RestakerChanged(getRoleMember(RESTAKER_ROLE, 0), newRestaker);
+		emit RestakerChanged(old, newRestaker);
 	}
 
 	function setOracle(address newOracle)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		require(newOracle != address(0), "vault: zero Oracle");
-		_revokeRole(ORACLE_ROLE, getRoleMember(ORACLE_ROLE, 0));
+		require(newOracle != address(0), "Vault: zero Oracle");
+		address old = getRoleMember(ORACLE_ROLE, 0);
+		_revokeRole(ORACLE_ROLE, old);
 		_grantRole(ORACLE_ROLE,  newOracle);
-		emit OracleChanged(getRoleMember(ORACLE_ROLE, 0), newOracle);
+		emit OracleChanged(old, newOracle);
+	}
+
+	function setQueue(address newQueue)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newQueue != address(0), "Vault: zero Queue");
+		address old = getRoleMember(QUEUE_ROLE, 0);
+		_revokeRole(QUEUE_ROLE, old);
+		_grantRole(QUEUE_ROLE,  newQueue);
+		emit QueueChanged(old, newQueue);
 	}
 
 	/* ----------------------- Asset sweeping ---------------------------- */
 	/**
-	 * @dev Idle ETH / ERC-20 sweeping.
+	 * @dev Idle ETH / ERC-20 sweeping. Only the licensed restaker can call.
 	 */
 	function sweep(address token, address to, uint256 amount)
 		external onlyRole(RESTAKER_ROLE)
@@ -134,7 +156,7 @@ contract RestakeVault is
 		if (token == address(0)) {
 			payable(to).sendValue(amount);               // reverts on failure
 		} else {
-			// ERC-20 sweep — compatible with non-standard tokens that return no bool
+			// ERC-20 sweep — compatible with tokens that return no bool
 			bytes memory data =
 				abi.encodeWithSelector(IERC20Upgradeable.transfer.selector, to, amount);
 			(bool ok, bytes memory ret) = token.call(data);
