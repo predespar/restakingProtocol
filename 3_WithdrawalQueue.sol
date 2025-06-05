@@ -1,9 +1,11 @@
-// SPDX‑License‑Identifier: MIT
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+/* ───────────────────────── OpenZeppelin upgradeable ───────────────────────── */
 import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 
+/* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IWrappedTokenQueue {
 	function burnForWithdrawal(address, uint256) external returns (uint256);
 	function paused() external view returns (bool);
@@ -14,80 +16,88 @@ interface IVaultQueue {
 }
 
 /**
- * @dev FIFO queue for withdrawals: each request is represented by an NFT ticket.
- *      (ETH flavour — token symbol wrsETHNFT)
+ * @title WithdrawalQueue
+ * @notice Each withdrawal request is represented by an ERC-721 NFT ticket (FIFO).
+ *         Built for wrstETH; other assets can reuse the same pattern later.
  */
-contract WithdrawalQueueETH is ERC721Upgradeable, AccessControlUpgradeable {
+contract WithdrawalQueue is
+	ERC721Upgradeable,
+	AccessControlEnumerableUpgradeable
+{
 	bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
 
-	struct Ticket { uint256 want; uint256 ready; }
+	/* ------------------------- External links ------------------------- */
+	IWrappedTokenQueue public wrstETHToken;
+	IVaultQueue        public vault;
 
-	IWrappedTokenQueue public token;   ///< wrstETH token proxy
-	IVaultQueue        public vault;   ///< RestakeVault proxy
+	/* ----------------------- ETH-specific state ----------------------- */
+	/// @dev id → order size in wei. id is cumulative sum at creation.
+	mapping(uint256 => uint256) public ethOrders;
 
-	uint256 public nextId;
-	uint256 public head;
-	mapping(uint256 => Ticket) public tickets;
+	uint256 public totalEthOrdered;            // wei requested
+	uint256 public totalEthReleased;           // wei released by oracle
 
-	/* ───────── Init ─── */
+	uint256 public totalEthOrders;             // count of ETH orders
+	uint256 public totalReleasedEthOrders;     // count already claimable
+
+	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
 		address admin,
-		address tokenAddr,
+		address wrstETHtokenAddr,
 		address vaultAddr
 	) external initializer {
 		__ERC721_init("wrstETH Withdrawal Ticket", "wrsETHNFT");
-		__AccessControl_init();
+		__AccessControlEnumerable_init();
+
 		_grantRole(DEFAULT_ADMIN_ROLE, admin);
 
-		token = IWrappedTokenQueue(tokenAddr);
-		vault = IVaultQueue(vaultAddr);
-		nextId = 1;
+		wrstETHToken = IWrappedTokenQueue(wrstETHtokenAddr);
+		vault        = IVaultQueue(vaultAddr);
 	}
 
-	/* ───────── User → request ─── */
-	function requestWithdraw(uint256 wrstWei) external returns (uint256 id) {
-		require(!token.paused(),             "Queue: paused");
-		require(!token.isFrozen(msg.sender), "Queue: frozen");
+	/* ------------------------ User: request ETH ----------------------- */
+	function requestWithdrawEth(uint256 wrstETHWei)
+		external returns (uint256 id)
+	{
+		require(!wrstETHToken.paused(),               "Queue: paused");
+		require(!wrstETHToken.isFrozen(msg.sender),   "Queue: frozen");
 
-		uint256 ethWei = token.burnForWithdrawal(msg.sender, wrstWei);
-		id             = nextId++;
-		tickets[id]    = Ticket(ethWei, 0);
+		uint256 ethWei = wrstETHToken.burnForWithdrawal(msg.sender, wrstETHWei);
+
+		// cumulative counters (ETH)
+		totalEthOrdered += ethWei;
+		unchecked { ++totalEthOrders; }
+
+		id              = totalEthOrdered;        // unique, increasing
+		ethOrders[id]   = ethWei;
+
 		_mint(msg.sender, id);
 	}
 
-	/* ───────── User → claim ─── */
-	function claim(uint256 id) external {
-		require(!token.paused(), "Queue: paused");
-		require(ownerOf(id) == msg.sender, "Queue: !owner");
-		require(!token.isFrozen(msg.sender), "Queue: frozen");
+	/* ------------------------- User: claim ETH ------------------------ */
+	function claimEth(uint256 id) external {
+		require(!wrstETHToken.paused(),               "Queue: paused");
+		require(ownerOf(id) == msg.sender,            "Queue: !owner");
+		require(!wrstETHToken.isFrozen(msg.sender),   "Queue: frozen");
+		require(id <= totalEthReleased,              "Queue: not ready");
 
-		Ticket storage t = tickets[id];
-		uint256 ready    = t.ready;
-		require(ready > 0, "Queue: not ready");
+		uint256 amt = ethOrders[id];
+		require(amt > 0, "Queue: already claimed");
 
-		t.ready = 0;
-		vault.releaseClaim(payable(msg.sender), ready);
-		if (t.want == 0) _burn(id);
+		delete ethOrders[id];
+		unchecked { ++totalReleasedEthOrders; }
+
+		_burn(id);
+		vault.releaseClaim(payable(msg.sender), amt);
 	}
 
-	/* ───────── Oracle → distribute ─── */
-	function process(uint256 availableWei, uint256 maxTickets)
+	/* ---------------- Oracle: release ETH liquidity ------------------- */
+	/**
+	 * @param availableWei Free ETH sent by oracle from the vault
+	 */
+	function processEth(uint256 availableWei)
 		external onlyRole(ORACLE_ROLE)
 	{
-		uint256 free      = availableWei;
-		uint256 processed = 0;
-
-		while (free > 0 && head < nextId && processed < maxTickets) {
-			Ticket storage t = tickets[++head];
-			if (t.want == 0) { processed++; continue; }
-
-			uint256 part = t.want;
-			if (part > free) part = free;
-
-			t.want  -= part;
-			t.ready += part;
-			free    -= part;
-			processed++;
-		}
+		totalEthReleased += availableWei;
 	}
 }
