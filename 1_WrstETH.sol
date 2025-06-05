@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/* ─────────── OpenZeppelin ─────────── */
+/* ───────────────────────── OpenZeppelin upgradeable ───────────────────────── */
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20CappedUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
@@ -10,14 +10,14 @@ import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 
-/* ─────────── Local interfaces ─────── */
+/* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IRestakeVault {
 	function reserveForClaims(uint256 ethWei) external;
 }
 
 /**
- * @title Wrapped Restaked ETH – wrstETH (v2)
- * @notice ERC-20 token side of the restaking protocol (ETH flavour).
+ * @title Wrapped Restaked ETH (wrstETH)
+ * @notice ERC-20 wrapper for restaked ETH. Mint on deposit, burn on withdrawal.
  */
 contract WrstETH is
 	ERC20CappedUpgradeable,
@@ -29,7 +29,7 @@ contract WrstETH is
 {
 	using AddressUpgradeable for address payable;
 
-	/* ───────── Roles ─────── */
+	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant FREEZER_ROLE       = keccak256("FREEZER_ROLE");
 	bytes32 public constant PAUSER_ROLE        = keccak256("PAUSER_ROLE");
 	bytes32 public constant CAP_MANAGER_ROLE   = keccak256("CAP_MANAGER_ROLE");
@@ -37,33 +37,36 @@ contract WrstETH is
 	bytes32 public constant ORACLE_ROLE        = keccak256("ORACLE_ROLE");
 	bytes32 public constant QUEUE_ROLE         = keccak256("QUEUE_ROLE");
 
-	/* ───────── Storage ───── */
-	IRestakeVault  public vault;           ///< vault that actually manages restaking/unrestaking ETH
-	uint256        public rateWei;         ///< ETH per 1 wrstETH (18 decimals)
-	uint256 public dailyMintCapWei;        ///< daily mint cap
-	uint256 public mintedTodayWei;         ///< minted today (18 decimals)
-	uint64  public currentDay;             ///< floor(block.timestamp / 1 days)
+	/* ------------------------------ Storage ---------------------------- */
+	IRestakeVault public vault;         ///< Restake vault that manages restaking/unrestaking
+	uint256       public rateWei;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
 
-	mapping(address => bool) private _frozen;
+	uint256 public dailyMintCapWei;     ///< 24-hour minting ceiling (in wrstETH wei)
+	uint256 public mintedTodayWei;      ///< Amount minted since currentDay
+	uint64  public currentDay;          ///< Floor(block.timestamp / 1 day)
 
-	/* ───────── Events ────── */
+	mapping(address => bool) private _frozen;   ///< Sanctions / fraud freeze list
+
+	/* ------------------------------ Events ----------------------------- */
 	event Frozen(address indexed account);
 	event Unfrozen(address indexed account);
-	event Confiscated(address indexed account, uint256 value);
-	event CapChanged(uint256 oldCap, uint256 newCap);
-	event DailyCapChanged(uint256 newDailyCap);
-	event RateChanged(uint256 oldRateWei, uint256 newRateWei);
-	event FreezerUpdated(address indexed oldFreezer, address indexed newFreezer);
-	event PauserUpdated(address indexed oldPauser,  address indexed newPauser);
+	event Confiscated(address indexed account, uint256 amount);
 
-	/* ───────── Init ──────── */
+	event CapChanged(uint256 oldCapWei, uint256 newCapWei);
+	event DailyCapChanged(uint256 newDailyCapWei);
+	event RateChanged(uint256 oldRateWei, uint256 newRateWei);
+
+	event FreezerChanged(address oldFreezer, address newFreezer);
+	event PauserChanged(address oldPauser,  address newPauser);
+
+	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
 		address admin,
 		address freezer,
 		address pauser,
 		address vaultAddr,
 		uint256 capWei,
-		uint8   dailyPercent                    // 1-100
+		uint8   dailyPercent              // must be 1-100
 	) external initializer {
 		require(dailyPercent >= 1 && dailyPercent <= 100, "wrstETH: bad %");
 
@@ -81,36 +84,21 @@ contract WrstETH is
 		_grantRole(LIMIT_MANAGER_ROLE, admin);
 
 		vault           = IRestakeVault(vaultAddr);
-		rateWei         = 1e18;                           // 1 wrstETH == 1 ETH on start
+		rateWei         = 1e18;                                     // 1:1 initial rate
 		dailyMintCapWei = capWei * dailyPercent / 100;
 		currentDay      = uint64(block.timestamp / 1 days);
 	}
 
-	/* ───────── Admin updates (freezer / pauser) ───────── */
-	function setFreezer(address oldFreezer, address newFreezer)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newFreezer != address(0), "wrstETH: zero freezer");
-		_revokeRole(FREEZER_ROLE, oldFreezer);
-		_grantRole(FREEZER_ROLE,  newFreezer);
-		emit FreezerUpdated(oldFreezer, newFreezer);
+	/* ------------------------------ Pause / Freeze --------------------- */
+	function pause()   external onlyRole(PAUSER_ROLE)  { _pause();  }
+	function unpause() external onlyRole(PAUSER_ROLE)  { _unpause();}
+
+	function freeze(address account)   external onlyRole(FREEZER_ROLE) {
+		_frozen[account] = true;  emit Frozen(account);
 	}
-
-	function setPauser(address oldPauser, address newPauser)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newPauser != address(0), "wrstETH: zero pauser");
-		_revokeRole(PAUSER_ROLE, oldPauser);
-		_grantRole(PAUSER_ROLE,  newPauser);
-		emit PauserUpdated(oldPauser, newPauser);
+	function unfreeze(address account) external onlyRole(FREEZER_ROLE) {
+		_frozen[account] = false; emit Unfrozen(account);
 	}
-
-	/* ───────── Pause / Freeze ───── */
-	function pause()   external onlyRole(PAUSER_ROLE)   { _pause();   }
-	function unpause() external onlyRole(PAUSER_ROLE)   { _unpause(); }
-
-	function freeze(address a)   external onlyRole(FREEZER_ROLE) { _frozen[a] = true;  emit Frozen(a); }
-	function unfreeze(address a) external onlyRole(FREEZER_ROLE) { _frozen[a] = false; emit Unfrozen(a); }
 	function confiscate(address account) external onlyRole(FREEZER_ROLE) {
 		require(_frozen[account], "wrstETH: not frozen");
 		uint256 bal = balanceOf(account);
@@ -119,12 +107,18 @@ contract WrstETH is
 	}
 	function isFrozen(address a) external view returns (bool) { return _frozen[a]; }
 
-	/* ───────── Cap & daily limit ───── */
+	/* ------------------------- Cap & daily limit ----------------------- */
+	/**
+	 * @dev Lowers or raises the absolute supply cap.
+	 *      The cap may be set *below* current totalSupply in order to block new
+	 *      deposits while allowing withdrawals.
+	 */
 	function setCap(uint256 newCapWei) external onlyRole(CAP_MANAGER_ROLE) {
-		require(newCapWei > 0, "cap 0");
+		require(newCapWei > 0, "wrstETH: cap 0");
 		emit CapChanged(cap(), newCapWei);
 		_updateCap(newCapWei);
-		// корректируем дневной лимит пропорционально
+
+		// Re-compute daily limit proportionally to the new cap
 		dailyMintCapWei = newCapWei * dailyMintCapWei / cap();
 	}
 
@@ -134,7 +128,21 @@ contract WrstETH is
 		emit DailyCapChanged(dailyMintCapWei);
 	}
 
-	/* ───────── Helpers — pricing ───── */
+	/* ------------------------ Role rotation (admin) -------------------- */
+	function setFreezer(address newFreezer) external onlyRole(DEFAULT_ADMIN_ROLE) {
+		require(newFreezer != address(0), "wrstETH: zero freezer");
+		_revokeRole(FREEZER_ROLE, getRoleMember(FREEZER_ROLE, 0));
+		_grantRole(FREEZER_ROLE,  newFreezer);
+		emit FreezerChanged(getRoleMember(FREEZER_ROLE, 0), newFreezer);
+	}
+	function setPauser(address newPauser)  external onlyRole(DEFAULT_ADMIN_ROLE) {
+		require(newPauser != address(0), "wrstETH: zero pauser");
+		_revokeRole(PAUSER_ROLE, getRoleMember(PAUSER_ROLE, 0));
+		_grantRole(PAUSER_ROLE,  newPauser);
+		emit PauserChanged(getRoleMember(PAUSER_ROLE, 0), newPauser);
+	}
+
+	/* --------------------------- Math helpers -------------------------- */
 	function getWrstETHByETH(uint256 ethWei) public view returns (uint256) {
 		return ethWei * 1e18 / rateWei;
 	}
@@ -142,46 +150,65 @@ contract WrstETH is
 		return wrstWei * rateWei / 1e18;
 	}
 
-	/* ───────── Transfer guard ─────── */
+	/* --------------------- Transfer guard overrides -------------------- */
 	function _beforeTokenTransfer(address from, address to, uint256 amount)
 		internal override
 	{
-		require(!paused(), "wrstETH: paused");
+		require(!paused(),               "wrstETH: paused");
 		require(!_frozen[from] && !_frozen[to], "wrstETH: frozen");
 		super._beforeTokenTransfer(from, to, amount);
 	}
 
-	/* ───────── Deposit (mint) ─────── */
+	/* ------------------------------ Deposit ---------------------------- */
+	/**
+	 * @notice Wrap ETH into wrstETH. Follows the checks-effects-interactions
+	 *         pattern and is protected by `nonReentrant`.
+	 *
+	 * @return mintedWei  Amount of wrstETH minted to the sender
+	 * @return refundWei  Excess ETH returned to the sender (if cap reached)
+	 */
 	function deposit()
 		external payable whenNotPaused nonReentrant
 		returns (uint256 mintedWei, uint256 refundWei)
 	{
 		require(msg.value > 0, "wrstETH: zero ETH");
 
-		// 1. checks — лимиты
-		uint256 wrstWeiWanted = getWrstETHByETH(msg.value);
-		uint256 remain        = cap() - totalSupply();
-		if (wrstWeiWanted > remain) wrstWeiWanted = remain;
-		require(remain > 0, "wrstETH: cap reached");
-		require(mintedTodayWei + wrstWeiWanted <= dailyMintCapWei, "wrstETH: daily cap");
+		/* ---------- Cap & daily-limit checks ---------- */
+		uint256 wrstWei = getWrstETHByETH(msg.value);
+		uint256 remainingCap = cap() - totalSupply();
+		if (wrstWei > remainingCap) wrstWei = remainingCap;
 
-		uint256 ethToRestake = getETHByWrstETH(wrstWeiWanted);
-		refundWei            = msg.value - ethToRestake;
+		// Reset counters at start of a new UTC day
+		uint64 today = uint64(block.timestamp / 1 days);
+		if (today > currentDay) {
+			currentDay      = today;
+			mintedTodayWei  = 0;
+		}
+		require(mintedTodayWei + wrstWei <= dailyMintCapWei, "wrstETH: daily cap");
 
-		// 2. interactions — отправляем ETH в хранилище
-		(bool okPush, ) = address(vault).call{value: ethToRestake}("");
-		require(okPush, "wrstETH: push fail");
+		/* ---------- Interactions ---------- */
+		uint256 ethToRestake = getETHByWrstETH(wrstWei);
+		// Send ETH to the vault; revert entire tx if transfer fails
+		payable(address(vault)).sendValue(ethToRestake);
+
+		// Return change if user over-sent because of cap exhaustion
+		refundWei = msg.value - ethToRestake;
 		if (refundWei > 0) payable(msg.sender).sendValue(refundWei);
+		
+		/* ---------- Effects ---------- */
+		mintedTodayWei += wrstWei;
+		_mint(msg.sender, wrstWei);
 
-		// 3. effects — фиксируем состояние после успешных интеракций
-		mintedTodayWei += wrstWeiWanted;
-		mintedWei       = wrstWeiWanted;
-		_mint(msg.sender, wrstWeiWanted);
+		mintedWei = wrstWei;
 	}
 
-	/* ───────── Burn by queue ─────── */
+	/* ------------------------------ Burn ------------------------------- */
+	/**
+	 * @dev Burn tokens when `WithdrawalQueue` prepares a withdrawal.
+	 *      Only callable by the queue contract.
+	 */
 	function burnForWithdrawal(address from, uint256 wrstWei)
-		external whenNotPaused onlyRole(QUEUE_ROLE) nonReentrant
+		external whenNotPaused onlyRole(QUEUE_ROLE)
 		returns (uint256 ethWei)
 	{
 		ethWei = getETHByWrstETH(wrstWei);
@@ -189,7 +216,7 @@ contract WrstETH is
 		vault.reserveForClaims(ethWei);
 	}
 
-	/* ───────── Oracle actions ─────── */
+	/* --------------------------- Oracle hooks -------------------------- */
 	function setRateWei(uint256 newRateWei) external onlyRole(ORACLE_ROLE) {
 		emit RateChanged(rateWei, newRateWei);
 		rateWei = newRateWei;
