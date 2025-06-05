@@ -25,13 +25,21 @@ interface IQueueOracle {
 contract RestakingOracle is AccessControlEnumerableUpgradeable {
 	bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
 
+	/* ------------------------- Pending addresses ----------------------- */
+	address public pendingAdmin;
+	address public pendingKeeper;
+
 	/* ------------------------- External links ------------------------- */
 	IWrstOracle  public wrstETHToken;
 	IVaultOracle public vault;
 	IQueueOracle public queue;
 
 	/* ---------------------------- Events ------------------------------ */
-	event KeeperChanged(address oldKeeper, address newKeeper);
+	event AdminProposed(  address indexed oldAdmin,   address indexed newAdmin);
+	event AdminChanged(   address indexed oldAdmin,   address indexed newAdmin);
+	
+	event KeeperProposed( address indexed oldKeeper,  address indexed newKeeper);
+	event KeeperChanged(  address indexed oldKeeper,  address indexed newKeeper);
 
 	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
@@ -50,17 +58,49 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 		queue        = IQueueOracle(queueAddr);
 	}
 
-	/* ----------------------- Admin: rotate keeper --------------------- */
-	function setKeeper(address newKeeper)
+	/* ------------------------ Role rotation (admin) -------------------- */
+	/* ----------------------- Two-phase: ADMIN ------------------------- */
+	function proposeAdmin(address newAdmin)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		emit KeeperChanged(getRoleMember(KEEPER_ROLE, 0), newKeeper);
-		_revokeRole(KEEPER_ROLE, getRoleMember(KEEPER_ROLE, 0));
-		_grantRole(KEEPER_ROLE,  newKeeper);
+		require(newAdmin != address(0), "Oracle: zero admin");
+		pendingAdmin = newAdmin;
+		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
+	}
+	
+	function acceptAdmin() external {
+		require(msg.sender == pendingAdmin, "Oracle: not pending admin");
+		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
+	
+		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
+		_revokeRole(DEFAULT_ADMIN_ROLE, old);
+	
+		emit AdminChanged(old, pendingAdmin);
+		pendingAdmin = address(0);
+	}
+	
+	/* ----------------------- Two-phase: KEEPER ------------------------ */
+	function proposeKeeper(address newKeeper)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newKeeper != address(0), "Oracle: zero keeper");
+		pendingKeeper = newKeeper;
+		emit KeeperProposed(getRoleMember(KEEPER_ROLE, 0), newKeeper);
+	}
+	
+	function acceptKeeper() external {
+		require(msg.sender == pendingKeeper, "Oracle: not pending keeper");
+		address old = getRoleMember(KEEPER_ROLE, 0);
+	
+		_grantRole(KEEPER_ROLE, pendingKeeper);
+		_revokeRole(KEEPER_ROLE, old);
+	
+		emit KeeperChanged(old, pendingKeeper);
+		pendingKeeper = address(0);
 	}
 
 	/* ------------------------- Main keeper job ------------------------ */
-	function pushReport(uint256 newRateWei, uint256 maxTickets)
+	function pushReport(uint256 newRateWei)
 		external
 		onlyRole(KEEPER_ROLE)
 	{
@@ -72,6 +112,6 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 		if (wrstETHToken.paused()) return;      // bunker mode
 
 		uint256 free = address(vault).balance - vault.getClaimReserveWei();
-		if (free > 0) queue.processEth(free, maxTickets);
+		if (free > 0) queue.processEth(free);
 	}
 }
