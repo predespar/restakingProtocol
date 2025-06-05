@@ -27,6 +27,10 @@ contract RestakeVault is
 	bytes32 public constant ORACLE_ROLE   = keccak256("ORACLE_ROLE");
 	bytes32 public constant QUEUE_ROLE    = keccak256("QUEUE_ROLE");
 
+	/* ------------------------- Pending addresses ----------------------- */
+	address public pendingAdmin;
+	address public pendingRestaker;
+
 	/* -------------------- External contract addresses ------------------ */
 	IWrstToken public wrstETHToken;   ///< wrstETH proxy (for pause checks)
 
@@ -34,7 +38,12 @@ contract RestakeVault is
 	uint256 private _claimReserveWei;    // Reserved for queued withdrawals
 
 	/* ------------------------------ Events ----------------------------- */
-	event RestakerChanged(address indexed oldRestaker, address indexed newRestaker);
+	event AdminProposed(    address indexed oldAdmin,    address indexed newAdmin);
+	event AdminChanged(     address indexed oldAdmin,    address indexed newAdmin);
+	
+	event RestakerProposed( address indexed oldRestaker, address indexed newRestaker);
+	event RestakerChanged(  address indexed oldRestaker, address indexed newRestaker);
+
 	event OracleChanged(  address indexed oldOracle,   address indexed newOracle);
 	event QueueChanged(   address indexed oldQueue,    address indexed newQueue);
 
@@ -115,17 +124,48 @@ contract RestakeVault is
 		return _claimReserveWei;
 	}
 
-	/* -------------------- Admin role rotation helpers ------------------ */
-	function setRestaker(address newRestaker)
+	/* ------------------------ Role rotation (admin) -------------------- */
+	/* ---------------------- Two-phase: ADMIN --------------------------- */
+	function proposeAdmin(address newAdmin)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		require(newRestaker != address(0), "Vault: zero Restaker");
+		require(newAdmin != address(0), "Vault: zero admin");
+		pendingAdmin = newAdmin;
+		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
+	}
+	
+	function acceptAdmin() external {
+		require(msg.sender == pendingAdmin, "Vault: not pending admin");
+		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
+	
+		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
+		_revokeRole(DEFAULT_ADMIN_ROLE, old);
+	
+		emit AdminChanged(old, pendingAdmin);
+		pendingAdmin = address(0);
+	}
+	
+	/* --------------------- Two-phase: RESTAKER ------------------------- */
+	function proposeRestaker(address newRestaker)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newRestaker != address(0), "Vault: zero restaker");
+		pendingRestaker = newRestaker;
+		emit RestakerProposed(getRoleMember(RESTAKER_ROLE, 0), newRestaker);
+	}
+	
+	function acceptRestaker() external {
+		require(msg.sender == pendingRestaker, "Vault: not pending restaker");
 		address old = getRoleMember(RESTAKER_ROLE, 0);
+	
+		_grantRole(RESTAKER_ROLE, pendingRestaker);
 		_revokeRole(RESTAKER_ROLE, old);
-		_grantRole(RESTAKER_ROLE,  newRestaker);
-		emit RestakerChanged(old, newRestaker);
+	
+		emit RestakerChanged(old, pendingRestaker);
+		pendingRestaker = address(0);
 	}
 
+	/* -------------------- One-step rotations (Oracle / Queue) ---------- */
 	function setOracle(address newOracle)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
