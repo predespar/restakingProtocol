@@ -223,7 +223,10 @@ contract WrstETH is
 	}
 
 	function resetDailyCounters() external onlyRole(ORACLE_ROLE) {
-		mintedTodayWei = 0;
-		currentDay     = uint64(block.timestamp / 1 days);
+		uint64 today = uint64(block.timestamp / 1 days);
+		if (today > currentDay) {
+			currentDay      = today;
+			mintedTodayWei  = 0;
+		}
 	}
 }
