@@ -1,115 +1,147 @@
-// SPDX‑License‑Identifier: MIT
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+/* ───────────────────────── OpenZeppelin upgradeable ───────────────────────── */
+import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 
-interface IWrappedRestakedToken {
-	function paused() external view returns (bool);
-}
-
-contract RestakeVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
+/**
+ * @title RestakeVault
+ * @notice restaking/unrestaking manager.
+ */
+contract RestakeVault is
+	AccessControlEnumerableUpgradeable,
+	ReentrancyGuardUpgradeable
+{
 	using AddressUpgradeable for address payable;
 
-	/* ───────── Roles ───── */
+	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant RESTAKER_ROLE = keccak256("RESTAKER_ROLE");
 	bytes32 public constant ORACLE_ROLE   = keccak256("ORACLE_ROLE");
 
-	/* ───────── External refs ───── */
-	IWrappedRestakedToken public wrappedToken;   ///< wrstETH (or USD/BTC) proxy
+	/* -------------------- External contract addresses ------------------ */
+	address public wrstETHToken;   ///< wrstETH proxy (for pause checks)
 
-	/* ───────── State ───── */
-	uint256 private _claimReserveWei;            ///< reserved ETH for queued claims
+	/* --------------------------- State vars ---------------------------- */
+	uint256 private _claimReserveWei;    // Reserved for queued withdrawals
 
-	/* ───────── Events ──── */
-	event RestakerUpdated(address indexed oldRestaker, address indexed newRestaker);
-	event OracleUpdated(  address indexed oldOracle,   address indexed newOracle);
+	/* ------------------------------ Events ----------------------------- */
+	event RestakerChanged(address oldRestaker, address newRestaker);
+	event OracleChanged(  address oldOracle,   address newOracle);
 
-	/* ───────── Initialiser ─ */
+	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
 		address admin,
 		address restaker,
 		address oracle,
-		address tokenAddr
+		address wrstETHAddr
 	) external initializer {
-		__AccessControl_init();
+		__AccessControlEnumerable_init();
 		__ReentrancyGuard_init();
 
 		_grantRole(DEFAULT_ADMIN_ROLE, admin);
 		_grantRole(RESTAKER_ROLE,     restaker);
 		_grantRole(ORACLE_ROLE,       oracle);
 
-		wrappedToken = IWrappedRestakedToken(tokenAddr);
+		wrstETHToken = wrstETHAddr;
 	}
 
-	/* ───────── Modifier: token not paused ───── */
-	modifier tokenNotPaused() {
-		require(!wrappedToken.paused(), "Vault: token paused");
+	/* ------------------------- Modifiers ------------------------------- */
+	modifier wrstETHNotPaused() {
+		(bool ok, bytes memory data) =
+			wrstETHToken.staticcall(abi.encodeWithSignature("paused()"));
+		require(ok && data.length == 32 && !abi.decode(data, (bool)),
+				"Vault: wrstETH paused");
 		_;
 	}
 
-	/* ───────── Outbound: send to restaking venue ───── */
-	function withdrawForRestaking(uint256 amountWei)
+	/* ----------------------- Liquidity outflow ------------------------- */
+	/**
+	 * @notice Move assets to restaking venue.
+	 */
+	function withdrawForRestaking(uint256 amountEthWei)
 		external
-		tokenNotPaused
-		onlyRole(RESTAKER_ROLE)
 		nonReentrant
+		wrstETHNotPaused
+		onlyRole(RESTAKER_ROLE)
 	{
-		require(address(this).balance - _claimReserveWei >= amountWei,
-				"Vault: insufficient liquidity");
+		require(
+			address(this).balance - _claimReserveWei >= amountWei,
+			"Vault: insufficient liquidity"
+		);
 		payable(msg.sender).sendValue(amountWei);
 	}
 
-	/* ───────── Inbound: restaker return ───── */
+	/* ----------------------- Liquidity inflow -------------------------- */
 	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {}
 
-	/* ───────── Oracle reserve / release ───── */
-	function reserveForClaims(uint256 ethWei) external onlyRole(ORACLE_ROLE) {
-		_claimReserveWei += ethWei;
-	}
+	/* -------------- Oracle reserve / release management ---------------- */
+	function reserveForClaims(uint256 ethWei)
+		external onlyRole(ORACLE_ROLE)
+	{ _claimReserveWei += ethWei; }
 
 	function releaseClaim(address payable user, uint256 ethWei)
-		external tokenNotPaused onlyRole(ORACLE_ROLE) nonReentrant
+		external
+		nonReentrant
+		wrstETHNotPaused
+		onlyRole(ORACLE_ROLE)
 	{
 		_claimReserveWei -= ethWei;
 		user.sendValue(ethWei);
 	}
 
-	/* ───────── Restricted getter for oracle ───── */
-	function getClaimReserveWei() external view onlyRole(ORACLE_ROLE) returns (uint256) {
+	/* ------------------------- Restricted getters ---------------------- */
+	function getClaimReserveWei()
+		external view
+		returns (uint256)
+	{
+		require(
+			hasRole(ORACLE_ROLE, msg.sender) ||
+			hasRole(RESTAKER_ROLE, msg.sender),
+			"Vault: access denied"
+		);
 		return _claimReserveWei;
 	}
 
-	/* ───────── Admin updates ───── */
-	function setRestaker(address oldRestaker, address newRestaker)
+	/* -------------------- Admin role rotation helpers ------------------ */
+	function setRestaker(address newRestaker)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		_revokeRole(RESTAKER_ROLE, oldRestaker);
+		require(newRestaker != address(0), "vault: zero Restaker");
+		_revokeRole(RESTAKER_ROLE, getRoleMember(RESTAKER_ROLE, 0));
 		_grantRole(RESTAKER_ROLE,  newRestaker);
-		emit RestakerUpdated(oldRestaker, newRestaker);
+		emit RestakerChanged(getRoleMember(RESTAKER_ROLE, 0), newRestaker);
 	}
 
-	function setOracle(address oldOracle, address newOracle)
+	function setOracle(address newOracle)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
 	{
-		_revokeRole(ORACLE_ROLE, oldOracle);
+		require(newOracle != address(0), "vault: zero Oracle");
+		_revokeRole(ORACLE_ROLE, getRoleMember(ORACLE_ROLE, 0));
 		_grantRole(ORACLE_ROLE,  newOracle);
-		emit OracleUpdated(oldOracle, newOracle);
+		emit OracleChanged(getRoleMember(ORACLE_ROLE, 0), newOracle);
 	}
 
-	/* ───────── Sweep accidental tokens ───── */
+	/* ----------------------- Asset sweeping ---------------------------- */
+	/**
+	 * @dev Idle ETH / ERC-20 sweeping.
+	 */
 	function sweep(address token, address to, uint256 amount)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
+		external onlyRole(RESTAKER_ROLE)
 	{
 		if (token == address(0)) {
-			payable(to).sendValue(amount);
+			payable(to).sendValue(amount);               // reverts on failure
 		} else {
-			(bool ok, bytes memory rtn) =
-				token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
-			require(ok && (rtn.length == 0 || abi.decode(rtn, (bool))), "Vault: sweep token");
+			// ERC-20 sweep — compatible with non-standard tokens that return no bool
+			bytes memory data =
+				abi.encodeWithSelector(IERC20Upgradeable.transfer.selector, to, amount);
+			(bool ok, bytes memory ret) = token.call(data);
+			require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "Vault: sweep ERC-20");
 		}
 	}
 
+	/* --------------------- Receive plain ETH --------------------------- */
 	receive() external payable {}
 }
