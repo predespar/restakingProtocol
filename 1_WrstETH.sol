@@ -69,12 +69,17 @@ contract WrstETH is
 	
 	event PauserProposed( address indexed oldPauser,  address indexed newPauser);
 	event PauserChanged(  address indexed oldPauser,  address indexed newPauser);
+	
+	event OracleChanged(  address indexed oldOracle,  address indexed newOracle);
+	event QueueChanged(   address indexed oldQueue,   address indexed newQueue);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
 		address admin,
 		address freezer,
 		address pauser,
+		address oracle,
+		address queue,
 		address vaultAddr,
 		uint256 capWei,
 		uint8   dailyPercent              // must be 1-100
@@ -93,6 +98,8 @@ contract WrstETH is
 		_grantRole(PAUSER_ROLE,        pauser);
 		_grantRole(CAP_MANAGER_ROLE,   admin);
 		_grantRole(LIMIT_MANAGER_ROLE, admin);
+		_grantRole(ORACLE_ROLE,        oracle);
+		_grantRole(QUEUE_ROLE,         queue);
 
 		vault           = IRestakeVault(vaultAddr);
 		rateWei         = 1e18;                                     // 1:1 initial rate
@@ -140,6 +147,26 @@ contract WrstETH is
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
+	/* ---------------- One-step rotation: ORACLE & QUEUE ---------------- */
+	function setOracle(address newOracle)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newOracle != address(0), "wrstETH: zero oracle");
+		address old = getRoleMember(ORACLE_ROLE, 0);
+		_grantRole(ORACLE_ROLE, newOracle);
+		_revokeRole(ORACLE_ROLE, old);
+		emit OracleChanged(old, newOracle);
+	}
+
+	function setQueue(address newQueue)
+		external onlyRole(DEFAULT_ADMIN_ROLE)
+	{
+		require(newQueue != address(0), "wrstETH: zero queue");
+		address old = getRoleMember(QUEUE_ROLE, 0);
+		_grantRole(QUEUE_ROLE, newQueue);
+		_revokeRole(QUEUE_ROLE, old);
+		emit QueueChanged(old, newQueue);
+	}
 	/* ------------------------- Two-phase: ADMIN ------------------------ */
 	function proposeAdmin(address newAdmin)
 		external onlyRole(DEFAULT_ADMIN_ROLE)
