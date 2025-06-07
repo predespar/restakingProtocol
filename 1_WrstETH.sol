@@ -13,6 +13,7 @@ import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IRestakeVault {
 	function reserveForClaims(uint256 ethWei) external;
+	function depositFromWrstETH() external payable;
 }
 
 /**
@@ -274,7 +275,7 @@ contract WrstETH is
 		/* ---------- Interactions ---------- */
 		uint256 ethToRestake = getETHByWrstETH(wrstWei);
 		// Send ETH to the vault; revert entire tx if transfer fails
-		payable(address(vault)).sendValue(ethToRestake);
+		vault.depositFromWrstETH{value: ethToRestake}();
 
 		// Return change if user over-sent because of cap exhaustion
 		refundWei = msg.value - ethToRestake;
