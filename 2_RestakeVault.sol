@@ -186,24 +186,6 @@ contract RestakeVault is
 		emit QueueChanged(old, newQueue);
 	}
 
-	/* ----------------------- Asset sweeping ---------------------------- */
-	/**
-	 * @dev Idle ETH / ERC-20 sweeping.
-	 */
-	function sweep(address token, address to, uint256 amount)
-		external onlyRole(RESTAKER_ROLE)
-	{
-		if (token == address(0)) {
-			payable(to).sendValue(amount);               // reverts on failure
-		} else {
-			// ERC-20 sweep — compatible with tokens that return no bool
-			bytes memory data =
-				abi.encodeWithSelector(IERC20Upgradeable.transfer.selector, to, amount);
-			(bool ok, bytes memory ret) = token.call(data);
-			require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "Vault: sweep ERC-20");
-		}
-	}
-
 	/* --------------------- Receive plain ETH --------------------------- */
 	receive() external payable {}
 }
