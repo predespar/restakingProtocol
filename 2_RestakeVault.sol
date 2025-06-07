@@ -26,6 +26,8 @@ contract RestakeVault is
 	bytes32 public constant RESTAKER_ROLE = keccak256("RESTAKER_ROLE");
 	bytes32 public constant ORACLE_ROLE   = keccak256("ORACLE_ROLE");
 	bytes32 public constant QUEUE_ROLE    = keccak256("QUEUE_ROLE");
+	/// @notice Granted **only** to the wrstETH contract – gate for incoming ETH.
+	bytes32 public constant WRSTETH_ROLE   = keccak256("WRSTETH_ROLE");
 
 	/* ------------------------- Pending addresses ----------------------- */
 	address public pendingAdmin;
@@ -62,6 +64,7 @@ contract RestakeVault is
 		_grantRole(RESTAKER_ROLE,     restaker);
 		_grantRole(ORACLE_ROLE,       oracle);
 		_grantRole(QUEUE_ROLE,        queue);
+		_grantRole(WRSTETH_ROLE,      wrstETHAddr); 
 
 		wrstETHToken = IWrstToken(wrstETHAddr);
 	}
@@ -92,6 +95,8 @@ contract RestakeVault is
 
 	/* ----------------------- Liquidity inflow -------------------------- */
 	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {}
+	
+	function depositFromWrstETH()  external payable onlyRole(WRSTETH_ROLE)  {}
 
 	/* -------------- Oracle reserve / release management ---------------- */
 	function reserveForClaims(uint256 ethWei)
