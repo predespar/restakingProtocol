@@ -188,7 +188,7 @@ contract RestakeVault is
 
 	/* ----------------------- Asset sweeping ---------------------------- */
 	/**
-	 * @dev Idle ETH / ERC-20 sweeping. Only the licensed restaker can call.
+	 * @dev Idle ETH / ERC-20 sweeping.
 	 */
 	function sweep(address token, address to, uint256 amount)
 		external onlyRole(RESTAKER_ROLE)
