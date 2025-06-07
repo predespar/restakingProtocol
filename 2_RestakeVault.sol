@@ -192,5 +192,7 @@ contract RestakeVault is
 	}
 
 	/* --------------------- Receive plain ETH --------------------------- */
-	receive() external payable {}
+	receive() external payable {
+		revert("Vault: direct ETH transfer not allowed");
+	}
 }
