@@ -389,7 +389,7 @@ contract WrstETH is
 		(mintedWei, refundWei) = _coreDeposit(
 			amount,
 			msg.value,
-			wETHIn > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
+			amount > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
 		);
 	}
 
