@@ -12,6 +12,12 @@ interface IWrstToken {
 	function paused() external view returns (bool);
 }
 
+// --- WETH9 minimal interface ---
+interface IWETH9 is IERC20Upgradeable {
+	function deposit() external payable;
+	function withdraw(uint256) external;
+}
+
 /**
  * @title RestakeVault
  * @notice Restaking / un-restaking manager.
@@ -20,7 +26,8 @@ contract RestakeVault is
 	AccessControlEnumerableUpgradeable,
 	ReentrancyGuardUpgradeable
 {
-	using AddressUpgradeable for address payable;
+	using AddressUpgradeable   for address payable;
+	using SafeERC20Upgradeable for IERC20Upgradeable;
 
 	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant RESTAKER_ROLE = keccak256("RESTAKER_ROLE");
@@ -35,6 +42,7 @@ contract RestakeVault is
 
 	/* -------------------- External contract addresses ------------------ */
 	IWrstToken public wrstETHToken;   ///< wrstETH proxy (for pause checks)
+	IWETH9     public wETH; 
 
 	/* --------------------------- State vars ---------------------------- */
 	uint256 private _claimReserveWei;    // Reserved for queued withdrawals
@@ -55,7 +63,8 @@ contract RestakeVault is
 		address restaker,
 		address oracle,
 		address queue,
-		address wrstETHAddr
+		address wrstETHAddr,
+		address wETHAddr
 	) external initializer {
 		__AccessControlEnumerable_init();
 		__ReentrancyGuard_init();
@@ -67,6 +76,7 @@ contract RestakeVault is
 		_grantRole(WRSTETH_ROLE,      wrstETHAddr); 
 
 		wrstETHToken = IWrstToken(wrstETHAddr);
+		wETH         = IWETH9(wETHAddr); 
 	}
 
 	/* ------------------------- Modifiers ------------------------------- */
@@ -96,7 +106,14 @@ contract RestakeVault is
 	/* ----------------------- Liquidity inflow -------------------------- */
 	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {}
 	
-	function depositFromWrstETH()  external payable onlyRole(WRSTETH_ROLE)  {}
+	function depositFromWrstETH(uint256 wethWei)
+		external
+		nonReentrant
+		onlyRole(WRSTETH_ROLE)
+	{
+		require(wethWei > 0, "Vault: zero wETH");
+		wETH.withdraw(wethWei);
+	}
 
 	/* -------------- Oracle reserve / release management ---------------- */
 	function reserveForClaims(uint256 ethWei)
@@ -106,14 +123,24 @@ contract RestakeVault is
 	/**
 	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
 	 */
-	function releaseClaim(address payable user, uint256 ethWei)
+	function releaseClaim(
+		address payable user,
+		uint256 ethWei,
+		uint256 wethWei
+	)
 		external
 		nonReentrant
 		wrstETHNotPaused
 		onlyRole(QUEUE_ROLE)
 	{
-		_claimReserveWei -= ethWei;
-		user.sendValue(ethWei);                      // reverts on failure
+		_claimReserveWei -= ethWei + wethWei;
+		// wETH portion first
+		if (wethWei > 0) {
+			wETH.deposit{value: wethWei}();          // wrap
+			wETH.safeTransfer(user, wethWei);
+		}
+		// ETH portion
+		if (ethWei > 0) user.sendValue(ethWei);      // reverts on failure
 	}
 
 	/* ------------------------- Restricted getters ---------------------- */
