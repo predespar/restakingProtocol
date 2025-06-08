@@ -12,7 +12,7 @@ interface IWrappedTokenQueue {
 	function isFrozen(address) external view returns (bool);
 }
 interface IVaultQueue {
-	function releaseClaim(address payable, uint256) external;
+	function releaseClaim(address payable, uint256 ethWei, uint256 wethWei) external;
 }
 
 /**
@@ -85,8 +85,12 @@ contract WithdrawalQueue is
 		_mint(msg.sender, id);
 	}
 
-	/* ------------------------- User: claim ETH ------------------------ */
-	function claimEth(uint256 id) external {
+	/* --------------------------- User: claim -------------------------- */
+	/**
+	 * @param id       NFT ticket id
+	 * @param wETHamt  How much of the total should be received in wETH (0 – all ETH)
+	 */
+	function claimEth(uint256 id, uint256 wETHamt) external {
 		require(!wrstETHToken.paused(),               "Queue: paused");
 		require(ownerOf(id) == msg.sender,            "Queue: !owner");
 		require(!wrstETHToken.isFrozen(msg.sender),   "Queue: frozen");
@@ -94,12 +98,14 @@ contract WithdrawalQueue is
 
 		uint256 amt = ethOrders[id];
 		require(amt > 0, "Queue: already claimed");
+		require(amt >= wETHamt, "Queue: wETH value exceeded");
 
 		delete ethOrders[id];
 		unchecked { ++totalReleasedEthOrders; }
 
 		_burn(id);
-		vault.releaseClaim(payable(msg.sender), amt);
+		uint256 ethAmt = amt - wETHamt;
+		vault.releaseClaim(payable(msg.sender), ethAmt, wETHamt);
 	}
 
 	/* ---------------- Oracle: release ETH liquidity ------------------- */
