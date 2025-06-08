@@ -9,6 +9,8 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgrad
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IRestakeVault {
@@ -16,15 +18,34 @@ interface IRestakeVault {
 	function depositFromWrstETH(uint256 wethWei) external;
 }
 
-// --- WETH9 minimal interface ---
+/* ──────────────── Uniswap Permit2 minimal interface ───────────────── */
 interface IWETH9 is IERC20Upgradeable {
 	function deposit() external payable;
 	function withdraw(uint256) external;
 }
 
+/* ──────────────── Uniswap Permit2 minimal interface ───────────────── */
+interface IPermit2 {
+	struct TokenPermissions { address token; uint256 amount; }
+	struct PermitTransferFrom {
+		TokenPermissions permitted;
+		uint256 nonce;
+		uint256 deadline;
+	}
+	struct SignatureTransferDetails { address to; uint256 requestedAmount; }
+
+	function permitTransferFrom(
+		PermitTransferFrom calldata permit,
+		SignatureTransferDetails calldata transferDetails,
+		address owner,
+		bytes calldata signature
+	) external;
+}
+
 /**
  * @title Wrapped Restaked ETH (wrstETH)
- * @notice ERC-20 wrapper over the restaked position. Mint on deposit, burn on withdrawal.
+ * @notice ERC-20 wrapper over the restaked position. Users can deposit any 
+               mix of ETH + wETH. Mint on deposit, burn on withdrawal.
  */
 contract WrstETH is
 	ERC20CappedUpgradeable,
@@ -61,6 +82,11 @@ contract WrstETH is
 	address public pendingAdmin;
 	address public pendingFreezer;
 	address public pendingPauser;
+	
+	/* --- constants ---------------------------------------------------- */
+	// Permit2 address is the same on Ethereum, Polygon, Arbitrum, Optimism, Gnosis, etc.
+	address private constant PERMIT2 =
+		0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
 	/* ------------------------------ Events ----------------------------- */
 	event Frozen(address indexed account);
@@ -255,68 +281,116 @@ contract WrstETH is
 		require(!_frozen[from] && !_frozen[to], "wrstETH: frozen");
 		super._beforeTokenTransfer(from, to, amount);
 	}
+	
+	/* --- core deposit routine (shared) -------------------------------- */
+	function _coreDeposit(
+		uint256 wETHIn,
+		uint256 ethIn,
+		bool    refundAsWETH   // true → refund in wETH, false → refund in ETH
+	)
+		private
+		returns (uint256 mintedWei, uint256 refundWei)
+	{
+		uint256 totalIn = wETHIn + ethIn;
+		require(totalIn > 0, "wrstETH: zero input");
+
+		/* ---------- Cap & daily-limit checks ---------- */
+		uint256 wrstWei = getWrstETHByETH(totalIn);
+		uint256 remain  = cap() - totalSupply();
+		if (wrstWei > remain) wrstWei = remain;
+
+		// Reset counters at start of a new UTC day
+		uint64 today = uint64(block.timestamp / 1 days);
+		if (today > currentDay) { currentDay = today; mintedTodayWei = 0; }
+		require(mintedTodayWei + wrstWei <= dailyMintCapWei,
+				"wrstETH: daily cap");
+
+		uint256 wethToRestake = getETHByWrstETH(wrstWei); // ETH == wETH 1:1
+		refundWei = totalIn - wethToRestake;
+
+		/* wrap ETH part */
+		if (ethIn > 0) wETH.deposit{value: wethToRestake}();
+
+		/* send to vault */
+		wETH.safeTransfer(address(vault), wethToRestake);
+		vault.depositFromWrstETH(wethToRestake);
+
+		/* refund */
+		if (refundWei > 0) {
+			if (refundAsWETH) {
+				wETH.safeTransfer(msg.sender, refundWei);
+			} else {
+				payable(msg.sender).sendValue(refundWei);
+			}
+		}
+
+		/* mint */
+		mintedTodayWei += wrstWei;
+		_mint(msg.sender, wrstWei);
+		mintedWei = wrstWei;
+	}
 
 	/* ------------------------------ Deposit ---------------------------- */
 	/**
-	 * @notice Deposit any mix of ETH (`msg.value`) and/or pre-wrapped wETH
-	 * 		       and wrap them into wrstETH. Follows the checks-effects-
-	 *             interactions pattern and is protected by `nonReentrant`.
-	 * @param  wETHIn Amount of wETH the user wants to supply from their wallet.
-	 *             Must be approved to this contract *before* calling.
-	 *
-	 * @return mintedWei  Amount of wrstETH minted to the sender
-	 * @return refundWei  Excess ETH returned to the sender (if cap reached)
-	 */
+	* @notice Deposit any mix of ETH (`msg.value`) and/or pre-wrapped wETH
+	* 		       and wrap them into wrstETH. Follows the checks-effects-
+	*             interactions pattern and is protected by `nonReentrant`.
+	* @param  wETHIn Amount of wETH the user wants to supply from their wallet.
+	*             Must be approved to this contract *before* calling.
+	*
+	* @return mintedWei  Amount of wrstETH minted to the sender
+	* @return refundWei  Excess ETH returned to the sender (if cap reached)
+	*/
 	function deposit(uint256 wETHIn)
 		external payable whenNotPaused nonReentrant
 		returns (uint256 mintedWei, uint256 refundWei)
 	{
-		require(msg.value + wETHIn > 0, "wrstETH: zero input");
-
-		/* ---------- Cap & daily-limit checks ---------- */
-		uint256 wrstWei = getWrstETHByETH(msg.value + wETHIn);
-		uint256 remainingCap = cap() - totalSupply();
-		if (wrstWei > remainingCap) wrstWei = remainingCap;
-
-		// Reset counters at start of a new UTC day
-		uint64 today = uint64(block.timestamp / 1 days);
-		if (today > currentDay) {
-			currentDay      = today;
-			mintedTodayWei  = 0;
+		if (wETHIn > 0) wETH.safeTransferFrom(msg.sender, address(this), wETHIn);
+		(mintedWei, refundWei) = _coreDeposit(
+			wETHIn,
+			msg.value,
+			wETHIn > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
+		);
+	}
+	
+	/* --- single-tx deposit via Uniswap Permit2 ------------------------ */
+	function depositWithPermit(
+		uint256 amount,       // wETH to pull
+		uint256 nonce,
+		uint256 deadline,
+		bytes calldata signature
+	)
+		external payable whenNotPaused nonReentrant
+		returns (uint256 mintedWei, uint256 refundWei)
+	{
+		if (amount > 0) {
+			IPermit2.PermitTransferFrom memory permit =
+				IPermit2.PermitTransferFrom({
+					permitted: IPermit2.TokenPermissions({
+						token: address(wETH),
+						amount: amount
+					}),
+					nonce: nonce,
+					// user-controlled deadline
+					deadline: deadline
+				});
+			IPermit2.SignatureTransferDetails memory details =
+				IPermit2.SignatureTransferDetails({
+					to: address(this),
+					requestedAmount: amount
+				});
+			IPermit2(PERMIT2).permitTransferFrom(
+				permit,
+				details,
+				msg.sender,
+				signature
+			);
 		}
-		require(mintedTodayWei + wrstWei <= dailyMintCapWei, "wrstETH: daily cap");
-
-		/* ---------- Interactions ---------- */
-		uint256 ethToRestake = getETHByWrstETH(wrstWei);
-		refundWei = msg.value + wETHIn - ethToRestake;
-		
-		if (msg.value > 0 && wETHIn == 0) {
-			// convert ETH to wETH
-			wETH.deposit{value: ethToRestake}();
-			
-			// Send wETH to the vault; revert entire tx if transfer fails
-			wETH.safeTransfer(address(vault), ethToRestake);
-			vault.depositFromWrstETH(ethToRestake);
-			
-			// Return change if user over-sent because of cap exhaustion
-			if (refundWei > 0) payable(msg.sender).sendValue(refundWei);
-		} else {
-			// convert ETH to wETH
-			wETH.deposit{value: msg.value + wETHIn}();
-			
-			// Send wETH to the vault; revert entire tx if transfer fails
-			wETH.safeTransfer(address(vault), ethToRestake);
-			vault.depositFromWrstETH(ethToRestake);
-			
-			// Return change if user over-sent because of cap exhaustion
-			if (refundWei > 0) wETH.safeTransfer(msg.sender, refundWei);
-		}
-		
-		/* ---------- Effects ---------- */
-		mintedTodayWei += wrstWei;
-		_mint(msg.sender, wrstWei);
-
-		mintedWei = wrstWei;
+		(mintedWei, refundWei) = _coreDeposit(
+			amount,
+			msg.value,
+			wETHIn > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
+		);
 	}
 
 	/* ------------------------------ Burn ------------------------------- */
