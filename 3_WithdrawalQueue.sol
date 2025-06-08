@@ -67,22 +67,28 @@ contract WithdrawalQueue is
 	}
 
 	/* ------------------------ User: request ETH ----------------------- */
-	function requestWithdrawEth(uint256 wrstETHWei)
+	function requestWithdrawEth(
+		uint256 wrstETHWei,
+		address receiver,
+		address owner
+	)
 		external returns (uint256 id)
 	{
-		require(!wrstETHToken.paused(),               "Queue: paused");
-		require(!wrstETHToken.isFrozen(msg.sender),   "Queue: frozen");
-
-		uint256 ethWei = wrstETHToken.burnForWithdrawal(msg.sender, wrstETHWei);
-
+		require(owner == msg.sender, 			   "wrstETH: only owner");
+		require(!wrstETHToken.paused(),            "Queue: paused");
+		require(!wrstETHToken.isFrozen(receiver),  "Queue: frozen");
+		require(!wrstETHToken.isFrozen(owner),     "Queue: frozen");
+		
+		uint256 ethWei = wrstETHToken.burnForWithdrawal(wrstETHWei, receiver, owner);
+		
 		// cumulative counters (ETH)
 		totalEthOrdered += ethWei;
 		unchecked { ++totalEthOrders; }
-
+		
 		id              = totalEthOrdered;        // unique, increasing
 		ethOrders[id]   = ethWei;
-
-		_mint(msg.sender, id);
+		
+		_mint(receiver, id);
 	}
 
 	/* --------------------------- User: claim -------------------------- */
