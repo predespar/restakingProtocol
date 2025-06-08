@@ -14,7 +14,7 @@ interface IVaultOracle {
 	function getClaimReserveWei() external view returns (uint256);
 }
 interface IQueueOracle {
-	function process(uint256 availableWei, uint256 maxTickets) external;
+	function process(uint256 availableWei) external;
 }
 
 /**
