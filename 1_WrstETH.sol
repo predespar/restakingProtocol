@@ -13,12 +13,18 @@ import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IRestakeVault {
 	function reserveForClaims(uint256 ethWei) external;
-	function depositFromWrstETH() external payable;
+	function depositFromWrstETH(uint256 wethWei) external;
+}
+
+// --- WETH9 minimal interface ---
+interface IWETH9 is IERC20Upgradeable {
+	function deposit() external payable;
+	function withdraw(uint256) external;
 }
 
 /**
  * @title Wrapped Restaked ETH (wrstETH)
- * @notice ERC-20 wrapper for restaked ETH. Mint on deposit, burn on withdrawal.
+ * @notice ERC-20 wrapper over the restaked position. Mint on deposit, burn on withdrawal.
  */
 contract WrstETH is
 	ERC20CappedUpgradeable,
@@ -29,6 +35,7 @@ contract WrstETH is
 	ReentrancyGuardUpgradeable
 {
 	using AddressUpgradeable for address payable;
+	using SafeERC20Upgradeable for IERC20Upgradeable;
 
 	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant FREEZER_ROLE       = keccak256("FREEZER_ROLE");
@@ -40,6 +47,8 @@ contract WrstETH is
 
 	/* ------------------------------ Storage ---------------------------- */
 	IRestakeVault public vault;         ///< Restake vault that manages restaking/unrestaking
+	IWETH9        public wETH;          // < WETH9 token address
+	
 	uint256       public rateWei;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
 
 	uint256 public dailyMintCapWei;     ///< 24-hour minting ceiling (in wrstETH wei)
@@ -82,6 +91,7 @@ contract WrstETH is
 		address oracle,
 		address queue,
 		address vaultAddr,
+		address wETHAddr, 
 		uint256 capWei,
 		uint8   dailyPercent              // must be 1-100
 	) external initializer {
@@ -103,6 +113,7 @@ contract WrstETH is
 		_grantRole(QUEUE_ROLE,         queue);
 
 		vault           = IRestakeVault(vaultAddr);
+		wETH            = IWETH9(wETHAddr); 
 		rateWei         = 1e18;                                     // 1:1 initial rate
 		dailyMintCapWei = capWei * dailyPercent / 100;
 		currentDay      = uint64(block.timestamp / 1 days);
@@ -247,20 +258,23 @@ contract WrstETH is
 
 	/* ------------------------------ Deposit ---------------------------- */
 	/**
-	 * @notice Wrap ETH into wrstETH. Follows the checks-effects-interactions
-	 *         pattern and is protected by `nonReentrant`.
+	 * @notice Deposit any mix of ETH (`msg.value`) and/or pre-wrapped wETH
+	 * 		       and wrap them into wrstETH. Follows the checks-effects-
+	 *             interactions pattern and is protected by `nonReentrant`.
+	 * @param  wETHIn Amount of wETH the user wants to supply from their wallet.
+	 *             Must be approved to this contract *before* calling.
 	 *
 	 * @return mintedWei  Amount of wrstETH minted to the sender
 	 * @return refundWei  Excess ETH returned to the sender (if cap reached)
 	 */
-	function deposit()
+	function deposit(uint256 wETHIn)
 		external payable whenNotPaused nonReentrant
 		returns (uint256 mintedWei, uint256 refundWei)
 	{
-		require(msg.value > 0, "wrstETH: zero ETH");
+		require(msg.value + wETHIn > 0, "wrstETH: zero input");
 
 		/* ---------- Cap & daily-limit checks ---------- */
-		uint256 wrstWei = getWrstETHByETH(msg.value);
+		uint256 wrstWei = getWrstETHByETH(msg.value + wETHIn);
 		uint256 remainingCap = cap() - totalSupply();
 		if (wrstWei > remainingCap) wrstWei = remainingCap;
 
@@ -274,12 +288,29 @@ contract WrstETH is
 
 		/* ---------- Interactions ---------- */
 		uint256 ethToRestake = getETHByWrstETH(wrstWei);
-		// Send ETH to the vault; revert entire tx if transfer fails
-		vault.depositFromWrstETH{value: ethToRestake}();
-
-		// Return change if user over-sent because of cap exhaustion
-		refundWei = msg.value - ethToRestake;
-		if (refundWei > 0) payable(msg.sender).sendValue(refundWei);
+		refundWei = msg.value + wETHIn - ethToRestake;
+		
+		if (msg.value > 0 && wETHIn == 0) {
+			// convert ETH to wETH
+			wETH.deposit{value: ethToRestake}();
+			
+			// Send wETH to the vault; revert entire tx if transfer fails
+			wETH.safeTransfer(address(vault), ethToRestake);
+			vault.depositFromWrstETH(ethToRestake);
+			
+			// Return change if user over-sent because of cap exhaustion
+			if (refundWei > 0) payable(msg.sender).sendValue(refundWei);
+		} else {
+			// convert ETH to wETH
+			wETH.deposit{value: msg.value + wETHIn}();
+			
+			// Send wETH to the vault; revert entire tx if transfer fails
+			wETH.safeTransfer(address(vault), ethToRestake);
+			vault.depositFromWrstETH(ethToRestake);
+			
+			// Return change if user over-sent because of cap exhaustion
+			if (refundWei > 0) wETH.safeTransfer(msg.sender, refundWei);
+		}
 		
 		/* ---------- Effects ---------- */
 		mintedTodayWei += wrstWei;
