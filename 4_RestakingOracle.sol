@@ -11,10 +11,10 @@ interface IWrstOracle {
 	function paused() external view returns (bool);
 }
 interface IVaultOracle {
-	function getClaimReserveWei() external view returns (uint256);
+	function claimReserveWei() external view returns (uint256);
 }
 interface IQueueOracle {
-	function process(uint256 availableWei) external;
+	function processEth(uint256 availableWei) external;
 }
 
 /**
@@ -111,7 +111,7 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 		/* ---------- Move excess liquidity to the queue --------------- */
 		if (wrstETHToken.paused()) return;      // bunker mode
 
-		uint256 free = address(vault).balance - vault.getClaimReserveWei();
+		uint256 free = address(vault).balance - vault.claimReserveWei();
 		if (free > 0) queue.processEth(free);
 	}
 }
