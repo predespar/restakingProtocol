@@ -6,6 +6,7 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgrad
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IWrstToken {
@@ -45,7 +46,7 @@ contract RestakeVault is
 	IWETH9     public wETH; 
 
 	/* --------------------------- State vars ---------------------------- */
-	uint256 private _claimReserveWei;    // Reserved for queued withdrawals
+	uint256 public claimReserveWei;    // Reserved for queued withdrawals
 
 	/* ------------------------------ Events ----------------------------- */
 	event AdminProposed(    address indexed oldAdmin,    address indexed newAdmin);
@@ -97,7 +98,7 @@ contract RestakeVault is
 		onlyRole(RESTAKER_ROLE)
 	{
 		require(
-			address(this).balance - _claimReserveWei >= amountEthWei,
+			address(this).balance - claimReserveWei >= amountEthWei,
 			"Vault: insufficient liquidity"
 		);
 		payable(msg.sender).sendValue(amountEthWei);   // reverts on failure
@@ -118,7 +119,7 @@ contract RestakeVault is
 	/* -------------- Oracle reserve / release management ---------------- */
 	function reserveForClaims(uint256 ethWei)
 		external onlyRole(ORACLE_ROLE)
-	{ _claimReserveWei += ethWei; }
+	{ claimReserveWei += ethWei; }
 
 	/**
 	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
@@ -133,7 +134,7 @@ contract RestakeVault is
 		wrstETHNotPaused
 		onlyRole(QUEUE_ROLE)
 	{
-		_claimReserveWei -= ethWei + wethWei;
+		claimReserveWei -= ethWei + wethWei;
 		// wETH portion first
 		if (wethWei > 0) {
 			wETH.deposit{value: wethWei}();          // wrap
@@ -141,19 +142,6 @@ contract RestakeVault is
 		}
 		// ETH portion
 		if (ethWei > 0) user.sendValue(ethWei);      // reverts on failure
-	}
-
-	/* ------------------------- Restricted getters ---------------------- */
-	function getClaimReserveWei()
-		external view
-		returns (uint256)
-	{
-		require(
-			hasRole(ORACLE_ROLE, msg.sender) ||
-			hasRole(RESTAKER_ROLE, msg.sender),
-			"Vault: access denied"
-		);
-		return _claimReserveWei;
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
