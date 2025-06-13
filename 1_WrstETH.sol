@@ -15,8 +15,8 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeab
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IRestakeVault {
-	function reserveForClaims(uint256 ethWei) external;
-	function depositFromWrstETH(uint256 wethWei) external;
+	function reserveForClaims(uint256 ethAmt) external;
+	function depositFromWrstETH(uint256 wethAmt) external;
 }
 
 /* ──────────────── Uniswap Permit2 minimal interface ───────────────── */
@@ -45,17 +45,18 @@ interface IPermit2 {
 
 /// @notice Interface to WithdrawalQueue for orderly ETH withdrawals
 interface IWithdrawalQueue {
-	/// @notice Burn `wrstETHWei` shares and enqueue withdrawal for `receiver`.
+	/// @notice Burn `wrstETH` shares and enqueue withdrawal for `receiver`.
 	/// @return ticketId sequential ID of withdrawal request
-	function requestWithdrawEth(uint256 wrstETHWei, address receiver, address owner)
+	function requestWithdrawEth(uint256 wrstEthAmt, address receiver, address owner)
 		external returns (uint256 ticketId);
 }
 
 /**
  * @title Wrapped Restaked ETH (wrstETH)
  * @notice ERC-4626 compliant vault wrapper over a restaked ETH position.
+ *         All calculations and values in this contract are expressed in Wei (10^-18 ETH).
  *         Users deposit ETH and/or wETH, receive wrstETH shares, and can
- *         burn shares to queue withdrawals. 
+ *         burn shares to queue withdrawals.
  */
 contract WrstETH is
 	ERC4626Upgradeable,
@@ -83,13 +84,13 @@ contract WrstETH is
 	IWithdrawalQueue    public withdrawalQueue;  // queue contract
 	
 	/// @notice ETH-per-share conversion rate (wei)
-	uint256 public rateWei;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
+	uint256 public ethRate;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
 
 	/// @notice Daily mint cap (in wrstETH shares)
-	uint256 public dailyMintCapWei;     ///< 24-hour minting ceiling (in wrstETH wei)
-	uint256 public mintedTodayWei;      ///< Amount minted since currentDay
-	uint64  public currentDay;          ///< Floor(block.timestamp / 1 day)
-	uint8   public dailyPercent;        ///< Percent of cap allowed per UTC day
+	uint256 public dailyMintCapAmt;         ///< 24-hour minting ceiling (in wrstETH)
+	uint256 public todayMintedShares;       ///< Amount of wrstETH shares minted today
+	uint64  public currentDay;              ///< Floor(block.timestamp / 1 day)
+	uint8   public dailyPercent;            ///< Percent of cap allowed per UTC day
 
 	mapping(address => bool) private _frozen;   ///< Sanctions / fraud freeze list
 
@@ -97,44 +98,48 @@ contract WrstETH is
 	address public pendingAdmin;
 	address public pendingFreezer;
 	address public pendingPauser;
-	
+
+	/* --------------------------- Rate update protection ---------------- */
+	// Use 64.64 fixed-point math for precision (Q64.64)
+	uint128 private constant MAX_ANNUAL_RATE_INCREASE_64x64 = 0x199999999999999A; // ≈0.2 in 64.64 (0.2 * 2^64)
+	uint128 private constant MAX_DAILY_RATE_INCREASE_64x64 = MAX_ANNUAL_RATE_INCREASE_64x64 / 365; // 0.2/365 * 1e18
+
 	/* --------------------------- constants ---------------------------- */
 	// Permit2 address is the same on Ethereum, Polygon, Arbitrum, Optimism, Gnosis, etc.
-	address private constant PERMIT2 =
-		0x000000000022D473030F116dDEE9F6B43aC78BA3;
+	address immutable PERMIT2;
 
 	/* ------------------------------ Events ----------------------------- */
-	event Frozen(address indexed account);
-	event Unfrozen(address indexed account);
-	event Confiscated(address indexed account, uint256 amount);
+	event Frozen(address account);
+	event Unfrozen(address account);
+	event Confiscated(address account, uint256 amount);
 
-	event CapChanged(uint256 oldCapWei, uint256 newCapWei);
-	event DailyCapChanged(uint256 newDailyCapWei);
-	event RateChanged(uint256 oldRateWei, uint256 newRateWei);
+	event CapChanged(uint256 oldCapAmt, uint256 newCapAmt);
+	event DailyCapChanged(uint256 newDailyCap);
+	event RateChanged(uint256 oldRate, uint256 newRate);
 
-	event AdminProposed(  address indexed oldAdmin,   address indexed newAdmin);
-	event AdminChanged(   address indexed oldAdmin,   address indexed newAdmin);
+	event AdminProposed(address oldAdmin, address newAdmin);
+	event AdminChanged(address oldAdmin, address newAdmin);
 	
-	event FreezerProposed(address indexed oldFreezer, address indexed newFreezer);
-	event FreezerChanged( address indexed oldFreezer, address indexed newFreezer);
+	event FreezerProposed(address oldFreezer, address newFreezer);
+	event FreezerChanged(address oldFreezer, address newFreezer);
 	
-	event PauserProposed( address indexed oldPauser,  address indexed newPauser);
-	event PauserChanged(  address indexed oldPauser,  address indexed newPauser);
+	event PauserProposed(address oldPauser, address newPauser);
+	event PauserChanged(address oldPauser, address newPauser);
 	
-	event OracleChanged(  address indexed oldOracle,  address indexed newOracle);
-	event QueueChanged(   address indexed oldQueue,   address indexed newQueue);
+	event OracleChanged(address oldOracle, address newOracle);
+	event QueueChanged(address oldQueue, address newQueue);
 	
 	event Deposit(
-		address indexed caller,
-		address indexed owner,
+		address caller,
+		address owner,
 		uint256 assets,
 		uint256 shares
 	);
 	
 	event Withdraw(
-		address indexed caller,
-		address indexed receiver,
-		address indexed owner,
+		address caller,
+		address receiver,
+		address owner,
 		uint256 assets,
 		uint256 shares
 	);
@@ -148,7 +153,7 @@ contract WrstETH is
 	 * @param queue         QUEUE_ROLE & WithdrawalQueue address
 	 * @param vaultAddr     RestakeVault address
 	 * @param wETHAddr      WETH9 address (underlying ERC-20 asset)
-	 * @param capWei        Total supply cap in shares
+	 * @param capAmt        Total supply cap in shares
 	 * @param _dailyPercent Percent of cap allowed per UTC day (1–100)
 	 */
 	function initialize(
@@ -159,13 +164,13 @@ contract WrstETH is
 		address queue,
 		address vaultAddr,
 		address wETHAddr, 
-		uint256 capWei,
-		uint8   dailyPercent              // must be 1-100
+		uint256 capAmt,
+		uint8   _dailyPercent              // must be 1-100
 	) external initializer {
-		require(dailyPercent >= 1 && dailyPercent <= 100, "wrstETH: bad %");
+		require(_dailyPercent >= 1 && _dailyPercent <= 100, "wrstETH: bad %");
 
 		__ERC4626_init(IERC20Upgradeable(wETHAddr), "Wrapped Restaked ETH", "wrstETH");
-		__ERC20Capped_init(capWei);
+		__ERC20Capped_init(capAmt);
 		__ERC20Permit_init("Wrapped Restaked ETH");
 		__AccessControlEnumerable_init();
 		__Pausable_init();
@@ -183,12 +188,18 @@ contract WrstETH is
 		withdrawalQueue = IWithdrawalQueue(queue);
 		wETH            = IWETH9(wETHAddr); 
 		
-		rateWei         = 1e18;                                     // 1:1 initial rate
+		ethRate         = 1e18;                                     // 1:1 initial rate
 		dailyPercent    = _dailyPercent;
-		dailyMintCapWei = capWei * dailyPercent / 100;
+		dailyMintCapAmt = capAmt * dailyPercent / 100;
 		currentDay      = uint64(block.timestamp / 1 days);
+
+		// Set immutable Permit2 address
+		// (hardcoded value for all supported networks)
+		// 0x000000000022D473030F116dDEE9F6B43aC78BA3
+		// solhint-disable-next-line immutable-vars-naming
+		assembly { sstore(PERMIT2.slot, 0x000000000022D473030F116dDEE9F6B43aC78BA3) }
 	}
-	
+
 	/* ───────────────────────── Modifiers ───────────────────────────── */
 	modifier notFrozen(address acct) {
 		require(!_frozen[acct], "wrstETH: frozen");
@@ -218,21 +229,22 @@ contract WrstETH is
 	 * @dev Lowers or raises the absolute supply cap.
 	 *      The cap may be set *below* current totalSupply in order to block new
 	 *      deposits while allowing withdrawals.
+	 * @param newCapAmt New total supply cap (in Wei).
 	 */
-	function setCap(uint256 newCapWei) external onlyRole(CAP_MANAGER_ROLE) {
-		require(newCapWei > 0, "wrstETH: cap 0");
-		emit CapChanged(cap(), newCapWei);
-		_updateCap(newCapWei);
+	function setCap(uint256 newCapAmt) external onlyRole(CAP_MANAGER_ROLE) {
+		require(newCapAmt > 0, "wrstETH: cap 0");
+		emit CapChanged(cap(), newCapAmt);
+		_updateCap(newCapAmt);
 
 		// Re-compute daily limit proportionally to the new cap
-		dailyMintCapWei = newCapWei * dailyMintCapWei / cap();
+		dailyMintCapAmt = newCapAmt * dailyPercent / 100;
 	}
 
 	function setDailyPercent(uint8 percent) external onlyRole(LIMIT_MANAGER_ROLE) {
 		require(percent >= 1 && percent <= 100, "wrstETH: bad %");
 		dailyPercent    = percent;
-		dailyMintCapWei = cap() * percent / 100;
-		emit DailyCapChanged(dailyMintCapWei);
+		dailyMintCapAmt = cap() * percent / 100;
+		emit DailyCapChanged(dailyMintCapAmt);
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
@@ -317,145 +329,179 @@ contract WrstETH is
 	}
 
 	/* --------------------------- Math helpers -------------------------- */
-	function getWrstETHByETH(uint256 ethWei) public view returns (uint256) {
-		return ethWei * 1e18 / rateWei;
+	function getWrstETHByETH(uint256 ethAmt) public view returns (uint256) {
+		return ethAmt * 1e18 / ethRate;
 	}
-	function getETHByWrstETH(uint256 wrstWei) public view returns (uint256) {
-		return wrstWei * rateWei / 1e18;
+	function getETHByWrstETH(uint256 wrstEthAmt) public view returns (uint256) {
+		return wrstEthAmt * ethRate / 1e18;
 	}
 
 	/* --------------------- Transfer guard overrides -------------------- */
 	function _beforeTokenTransfer(address from, address to, uint256 amount)
 		internal override
 	{
-		require(!paused(),               "wrstETH: paused");
-		require(!_frozen[from] && !_frozen[to], "wrstETH: frozen");
+		require(!paused(), "wrstETH: paused");
+		require(!_frozen[from], "wrstETH: from is frozen");
+		require(!_frozen[to], "wrstETH: to is frozen");
 		super._beforeTokenTransfer(from, to, amount);
 	}
-	
-	/* ----------------- core deposit routine (shared) ------------------ */
+
+	/* --------------------- Core deposit routine ------------------------ */
+	/**
+	 * @dev Internal function to handle deposits of ETH and/or wETH.
+	 *      Calculates the total deposit, checks caps and limits, mints shares, and handles refunds.
+	 * @param wethAmt Amount of wETH provided by the user (in Wei).
+	 * @param ethAmt Amount of ETH provided by the user (in Wei).
+	 * @param receiver Address that will receive the minted shares and refund (in ETH or wETH).
+	 * @param refundAsWETH If true, refunds will be issued in wETH; otherwise, in ETH.
+	 * @return mintedShares Number of wrstETH shares minted for the deposit (in Wei).
+	 * @return refundEthAmt Amount of ETH refunded to the user (in Wei).
+	 */
 	function _coreDeposit(
-		uint256 wETHIn,
-		uint256 ethIn,
+		uint256 wethAmt,
+		uint256 ethAmt,
 		address receiver,
-		bool    refundAsWETH   // true → refund in wETH, false → refund in ETH
+		bool    refundAsWETH
 	)
 		private
-		returns (uint256 mintedWei, uint256 refundWei)
+		returns (uint256 mintedShares, uint256 refundEthAmt)
 	{
-		uint256 totalIn = wETHIn + ethIn;
-		require(totalIn > 0, "wrstETH: zero input");
-
-		/* ---------- Cap & daily-limit checks ---------- */
-		uint256 wrstWei = getWrstETHByETH(totalIn);
-		uint256 remain  = cap() - totalSupply();
-		if (wrstWei > remain) wrstWei = remain;
-
-		// Reset counters at start of a new UTC day
+		// Reset daily counters if a new UTC day has started
 		uint64 today = uint64(block.timestamp / 1 days);
-		if (today > currentDay) { currentDay = today; mintedTodayWei = 0; }
-		require(mintedTodayWei + wrstWei <= dailyMintCapWei,
-				"wrstETH: daily cap");
+		if (today > currentDay) {
+			currentDay           = today;
+			todayMintedShares    = 0;
+		}
 
-		uint256 wethToRestake = getETHByWrstETH(wrstWei); // ETH == wETH 1:1
-		refundWei = totalIn - wethToRestake;
+		// Calculate the total deposit amount (ETH + wETH)
+		uint256 totalAssetAmt = wethAmt + ethAmt;
+		require(totalAssetAmt > 0, "wrstETH: zero input");
 
-		/* wrap ETH part */
-		if (ethIn > 0) wETH.deposit{value: wethToRestake}();
+		// Calculate the number of shares to mint based on the total deposit
+		uint256 shares = getWrstETHByETH(totalAssetAmt);
 
-		/* send to vault */
-		wETH.safeTransfer(address(vault), wethToRestake);
-		vault.depositFromWrstETH(wethToRestake);
+		// Ensure the minting does not exceed the cap or daily limit
+		uint256 remainShares = cap() - totalSupply();
+		if (shares > remainShares) shares = remainShares;
+		require(todayMintedShares + shares <= dailyMintCapAmt, "wrstETH: daily cap");
 
-		/* refund */
-		if (refundWei > 0) {
+		// Calculate the amount of wETH required for restaking
+		uint256 assetsToRestake = getETHByWrstETH(shares);
+
+		// Calculate the refund amount (if any)
+		refundEthAmt = totalAssetAmt - assetsToRestake;
+
+		// Wrap ETH into wETH if ETH was provided
+		if (ethAmt > 0) wETH.deposit{value: assetsToRestake}();
+
+		// Transfer wETH to the vault for restaking
+		wETH.safeTransfer(address(vault), assetsToRestake);
+		// The vault will unwrap wETH into ETH upon receiving it.
+		vault.depositFromWrstETH(assetsToRestake);
+
+		// Issue refunds to the user
+		if (refundEthAmt > 0) {
 			if (refundAsWETH) {
-				wETH.safeTransfer(receiver, refundWei);
+				wETH.safeTransfer(receiver, refundEthAmt);
 			} else {
-				payable(receiver).sendValue(refundWei);
+				payable(receiver).sendValue(refundEthAmt);
 			}
 		}
 
-		/* mint */
-		mintedTodayWei += wrstWei;
-		_mint(receiver, wrstWei);
-		
-		emit Deposit(msg.sender, receiver, wETHIn + ethIn, wrstWei);
-		
-		return (wrstWei, refundWei);
+		// Mint wrstETH shares to the receiver
+		todayMintedShares += shares;
+		_mint(receiver, shares);
+
+		// Emit a deposit event
+		emit Deposit(msg.sender, receiver, totalAssetAmt - refundEthAmt, shares);
+
+		return (shares, refundEthAmt);
 	}
 
-	/* ------------------------------ Deposit ---------------------------- */
 	/**
-	* @notice Deposit any mix of ETH (`msg.value`) and/or pre-wrapped wETH
-	* 		       and wrap them into wrstETH. Follows the checks-effects-
-	*              interactions pattern and is protected by `nonReentrant`.
-	* @param  wETHIn    Amount of wETH the user wants to supply from their wallet.
-	*                       Must be approved to this contract *before* calling.
-	* @param receiver   who will receive minted shares
-	*
-	* @return mintedWei  Amount of wrstETH minted to the sender
-	* @return refundWei  Excess ETH returned to the sender (if cap reached)
-	*/
-	function deposit(uint256 wETHIn, address receiver)
-		external payable whenNotPaused nonReentrant notFrozen(msg.sender) notFrozen(receiver)
-		returns (uint256 mintedWei, uint256 refundWei)
+	 * @notice Deposit a mix of ETH (`msg.value`) and/or pre-wrapped wETH into the protocol.
+	 *         Mints wrstETH shares for the user and handles refunds if the cap is reached.
+	 * @param wethAmt Amount of wETH provided by the user (in Wei).
+	 * @param receiver Address that will receive the minted shares and refund (in ETH or wETH).
+	 * @param owner Address of the owner of the tokens being deposited.
+	 * @return mintedShares Number of wrstETH shares minted for the deposit (in Wei).
+	 * @return refundEthAmt Amount of ETH or wETH refunded to the receiver (in Wei).
+	 */
+	function deposit(uint256 wethAmt, address receiver, address owner)
+		external payable whenNotPaused nonReentrant notFrozen(owner) notFrozen(receiver)
+		returns (uint256 mintedShares, uint256 refundEthAmt)
 	{
-		if (wETHIn > 0) wETH.safeTransferFrom(msg.sender, address(this), wETHIn);
-		(mintedWei, refundWei) = _coreDeposit(
-			wETHIn,
+		// Check allowance if wETH is provided
+		if (wethAmt > 0) {
+			if (owner != msg.sender) {
+				uint256 allowed = wETH.allowance(owner, msg.sender);
+				require(allowed >= wethAmt, "ERC20: insufficient allowance");
+				wETH.safeTransferFrom(owner, address(this), wethAmt);
+			} else {
+				wETH.safeTransferFrom(msg.sender, address(this), wethAmt);
+			}
+		}
+
+		(mintedShares, refundEthAmt) = _coreDeposit(
+			wethAmt,
 			msg.value,
 			receiver,
-			wETHIn > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
+			wethAmt > 0  /* Refund in wETH if wETH was provided */
 		);
 	}
-	
+
 	/**
-	 * @notice Single-tx deposit via Uniswap Permit2 + optional ETH, mint shares.
-	 * @param assets     how much wETH to pull
-	 * @param receiver   who will receive minted shares
-	 * @param nonce      Permit2 nonce
-	 * @param deadline   Permit2 deadline
-	 * @param signature  Permit2 signature
+	 * @notice Deposit wETH via Uniswap Permit2 and optionally ETH in a single transaction.
+	 *         Mints wrstETH shares for the user and handles refunds if the cap is reached.
+	 * @param wethAmt Amount of wETH to pull from the user's wallet (in Wei).
+	 * @param receiver Address that will receive the minted shares and refund (in ETH or wETH).
+	 * @param owner Address of the owner of the tokens being deposited.
+	 * @param nonce Permit2 nonce for the user's approval.
+	 * @param deadline Permit2 deadline for the approval.
+	 * @param signature Permit2 signature for the approval.
+	 * @return mintedShares Number of wrstETH shares minted for the deposit (in Wei).
+	 * @return refundEthAmt Amount of ETH refunded to the receiver (in Wei).
 	 */
 	function depositWithPermit(
-		uint256 amount,
+		uint256 wethAmt,
 		address receiver,
+		address owner,
 		uint256 nonce,
 		uint256 deadline,
 		bytes calldata signature
 	)
-		external payable whenNotPaused nonReentrant notFrozen(msg.sender) notFrozen(receiver)
-		returns (uint256 mintedWei, uint256 refundWei)
+		external payable whenNotPaused nonReentrant
+		notFrozen(msg.sender) notFrozen(owner) notFrozen(receiver)
+		returns (uint256 mintedShares, uint256 refundEthAmt)
 	{
-		if (amount > 0) {
+		if (wethAmt > 0) {
 			IPermit2.PermitTransferFrom memory permit =
 				IPermit2.PermitTransferFrom({
 					permitted: IPermit2.TokenPermissions({
 						token: address(wETH),
-						amount: amount
+						amount: wethAmt
 					}),
 					nonce: nonce,
-					// user-controlled deadline
 					deadline: deadline
 				});
 			IPermit2.SignatureTransferDetails memory details =
 				IPermit2.SignatureTransferDetails({
 					to: address(this),
-					requestedAmount: amount
+					requestedAmount: wethAmt
 				});
 			IPermit2(PERMIT2).permitTransferFrom(
 				permit,
 				details,
-				msg.sender,
+				owner,
 				signature
 			);
 		}
-		(mintedWei, refundWei) = _coreDeposit(
-			amount,
-			receiver,
+
+		(mintedShares, refundEthAmt) = _coreDeposit(
+			wethAmt,
 			msg.value,
-			amount > 0  /*refundAsWETH*/       // mixed deposit → refund wETH
+			receiver,
+			wethAmt > 0  /* Refund in wETH if wETH was provided */
 		);
 	}
 
@@ -464,60 +510,106 @@ contract WrstETH is
 	 * @dev Burn tokens when `WithdrawalQueue` prepares a withdrawal.
 	 *      Only callable by the queue contract.
 	 */
-	function burnForWithdrawal(uint256 wrstWei, address receiver, address owner)
+	function burnForWithdrawal(uint256 wrstEthAmt, address receiver, address owner)
 		external onlyRole(QUEUE_ROLE)
-		returns (uint256 ethWei)
+		returns (uint256 ethAmt)
 	{
-		ethWei = getETHByWrstETH(wrstWei);
-		_burn(from, wrstWei);
-		vault.reserveForClaims(ethWei);
-		emit Withdraw(msg.sender, receiver, owner, ethWei, wrstWei);
+		ethAmt = getETHByWrstETH(wrstEthAmt);
+		_burn(owner, wrstEthAmt);
+		vault.reserveForClaims(ethAmt);
+		emit Withdraw(msg.sender, receiver, owner, ethAmt, wrstEthAmt);
 	}
 
 	/* --------------------------- Oracle hooks -------------------------- */
-	function setRateWei(uint256 newRateWei) external onlyRole(ORACLE_ROLE) {
-		emit RateChanged(rateWei, newRateWei);
-		rateWei = newRateWei;
+	/**
+	 * @notice Updates the ETH-to-wrstETH conversion rate.
+	 * @param newRate The new ETH-to-wrstETH conversion rate.
+	 */
+	function setRate(uint256 newRate) external onlyRole(ORACLE_ROLE) {
+		// Ensure at least 23 hours have passed since the last update
+		require(block.timestamp >= lastRateUpdate + 23 hours, "wrstETH: update too soon");
+
+		// Ensure the new rate is not less than the current rate
+		require(newRate >= ethRate, "wrstETH: rate cannot decrease");
+
+		// Calculate max allowed rate using 64.64 fixed-point math
+		// maxAllowedRate = ethRate + ethRate * MAX_DAILY_RATE_INCREASE_64x64 >> 64
+		uint256 maxAllowedRate = ethRate + (ethRate * uint256(MAX_DAILY_RATE_INCREASE_64x64) >> 64);
+		require(newRate <= maxAllowedRate, "wrstETH: rate increase too high");
+
+		// Update the rate and timestamp
+		emit RateChanged(ethRate, newRate);
+		ethRate = newRate;
+		lastRateUpdate = block.timestamp;
 	}
 
 	function resetDailyCounters() external onlyRole(ORACLE_ROLE) {
 		uint64 today = uint64(block.timestamp / 1 days);
 		if (today > currentDay) {
-			currentDay      = today;
-			mintedTodayWei  = 0;
+			currentDay           = today;
+			todayMintedShares    = 0;
 		}
 	}
 	
-	/* ========== ERC-4626 OVERWRIDES ========== */
+	/* ========== ERC-4626 OVERWRITES ========== */
 
-	/// @inheritdoc ERC4626Upgradeable
+	/**
+	 * @notice Returns the total amount of underlying assets managed by the vault.
+	 * @return Total assets in the vault (in Wei).
+	 */
 	function totalAssets() public view override returns (uint256) {
-		return totalSupply();
+		// Calculate total assets based on totalSupply and the current ethRate
+		return totalSupply() * ethRate / 1e18;
 	}
 
-	/// @inheritdoc ERC4626Upgradeable
+	/**
+	 * @notice Converts a given amount of assets to the equivalent amount of shares.
+	 * @param assets Amount of assets to convert (in Wei).
+	 * @return Equivalent amount of shares (in Wei).
+	 */
 	function convertToShares(uint256 assets) public view override returns (uint256) {
-		return assets * 1e18 / rateWei;
+		return getWrstETHByETH(assets);
 	}
 
-	/// @inheritdoc ERC4626Upgradeable
+	/**
+	 * @notice Converts a given amount of shares to the equivalent amount of assets.
+	 * @param shares Amount of shares to convert (in Wei).
+	 * @return Equivalent amount of assets (in Wei).
+	 */
 	function convertToAssets(uint256 shares) public view override returns (uint256) {
-		return shares * rateWei / 1e18;
+		return getETHByWrstETH(shares);
 	}
 
-	/// @inheritdoc ERC4626Upgradeable
-	function mint(uint256 shares, address receiver)
-		public override nonReentrant whenNotPaused returns (uint256 assets)
+	/**
+	 * @notice Mints `shares` to `receiver` by depositing the required amount of assets.
+	 * @param shares Amount of shares to mint (in Wei).
+	 * @param receiver Address that will receive the minted shares.
+	 * @param owner Address of the owner of the assets being deposited.
+	 * @return assets Amount of assets deposited to mint the shares (in Wei).
+	 */
+	function mint(uint256 shares, address receiver, address owner)
+		public override nonReentrant whenNotPaused notFrozen(owner) notFrozen(receiver)
+		returns (uint256 assets)
 	{
-		(mintedWei, refundWei) = deposit(shares, receiver);
-		return mintedWei;
+		// Calculate the amount of assets required to mint the requested shares
+		assets = getETHByWrstETH(shares);
+
+		// Call the deposit function to handle the asset transfer and minting
+		(uint256 mintedShares, ) = deposit(assets, receiver, owner);
+
+		// Ensure the minted shares match the requested amount
+		require(mintedShares == shares, "ERC4626: insufficient cap for minting");
 	}
 
-	/// @inheritdoc ERC4626Upgradeable
-	function withdraw(uint256, address, address) public pure override {
-		withdrawalQueue.requestWithdrawEth(uint256, address);
-	}
-	
+	/**
+	 * @notice Withdraws `assets` from the vault and burns the equivalent shares.
+	 *         Assets will not be returned immediately but will be claimable later
+     *         via `claimEth` in the `WithdrawalQueue` contract.
+	 * @param assets Amount of assets to withdraw (in Wei).
+	 * @param receiver Address that will receive the withdrawn assets.
+	 * @param owner Address of the owner of the shares being burned.
+	 * @return shares Amount of shares burned to withdraw the assets (in Wei).
+	 */
 	function withdraw(
 		uint256 assets,
 		address receiver,
@@ -530,13 +622,31 @@ contract WrstETH is
 		notFrozen(receiver)
 		returns (uint256 shares)
 	{
-		require(owner == msg.sender, "wrstETH: only owner");
-	
+		// Calculate the amount of shares corresponding to the assets
 		shares = getWrstETHByETH(assets);
+
+		// If owner is not msg.sender, check allowance
+		if (owner != msg.sender) {
+			uint256 allowed = allowance(owner, msg.sender);
+			require(allowed >= shares, "ERC4626: insufficient allowance");
+		}
+
+		// Burn the shares and enqueue the withdrawal
 		withdrawalQueue.requestWithdrawEth(shares, receiver, owner);
+
+		// Return the amount of shares burned
+		return shares;
 	}
 
-	/// @inheritdoc ERC4626Upgradeable
+	/**
+	 * @notice Redeems `shares` for the equivalent amount of assets.
+	 *         Assets will not be returned immediately but will be claimable
+     *         later via `claimEth` in the `WithdrawalQueue` contract.
+	 * @param shares Amount of shares to redeem (in Wei).
+	 * @param receiver Address that will receive the redeemed assets.
+	 * @param owner Address of the owner of the shares being redeemed.
+	 * @return assets Amount of assets redeemed (in Wei).
+	 */
 	function redeem(
 		uint256 shares,
 		address receiver,
@@ -550,8 +660,84 @@ contract WrstETH is
 		notFrozen(receiver)
 		returns (uint256 assets)
 	{
-		require(owner == msg.sender, "wrstETH: only owner");
+		// Calculate the amount of assets corresponding to the shares
 		assets = getETHByWrstETH(shares);
+
+		// If owner is not msg.sender, check allowance
+		if (owner != msg.sender) {
+			uint256 allowed = allowance(owner, msg.sender);
+			require(allowed >= shares, "ERC4626: insufficient allowance");
+		}
+
+		// Burn the shares and enqueue the withdrawal
 		withdrawalQueue.requestWithdrawEth(shares, receiver, owner);
+
+		// Return the amount of assets that will be claimable later
+		return assets;
+	}
+
+	/**
+	 * @notice Standard ERC-4626 deposit: deposit wETH and receive shares.
+	 *         According to the ERC-4626 standard, this function must only accept wETH (ERC20), not ETH.
+	 *         If the user mistakenly sends ETH, the transaction will revert.
+	 * @param assets Amount of wETH to deposit (in Wei).
+	 * @param receiver Address to receive the minted wrstETH shares.
+	 * @return shares Amount of wrstETH shares minted.
+	 */
+	function deposit(uint256 assets, address receiver)
+		public
+		override
+		whenNotPaused
+		nonReentrant
+		returns (uint256 shares)
+	{
+		require(msg.value == 0, "wrstETH: do not send ETH, use wETH transfer");
+		// Standard ERC-4626 logic: transfer wETH using transferFrom
+		IERC20Upgradeable assetToken = IERC20Upgradeable(asset());
+		if (assets > 0) {
+			assetToken.safeTransferFrom(msg.sender, address(this), assets);
+		}
+		(uint256 mintedShares, ) = _coreDeposit(assets, 0, receiver, false);
+		return mintedShares;
+	}
+
+	/**
+	 * @notice Standard ERC-4626 mint: mint shares by depositing the required amount of wETH.
+	 *         According to the ERC-4626 standard, this function must only accept wETH (ERC20), not ETH.
+	 *         If the user mistakenly sends ETH, the transaction will revert.
+	 * @param shares Amount of shares to mint (in Wei).
+	 * @param receiver Address to receive the minted wrstETH shares.
+	 * @return assets Amount of wETH deposited to mint the shares (in Wei).
+	 */
+	function mint(uint256 shares, address receiver)
+		public
+		override
+		whenNotPaused
+		nonReentrant
+		returns (uint256 assets)
+	{
+		require(msg.value == 0, "wrstETH: do not send ETH, use wETH transfer");
+		assets = getETHByWrstETH(shares);
+		IERC20Upgradeable assetToken = IERC20Upgradeable(asset());
+		if (assets > 0) {
+			assetToken.safeTransferFrom(msg.sender, address(this), assets);
+		}
+		(uint256 mintedShares, ) = _coreDeposit(assets, 0, receiver, false);
+		require(mintedShares == shares, "ERC4626: insufficient cap for minting");
+		return assets;
+	}
+
+	/**
+	 * @notice Returns the maximum amount of assets that can be deposited for the given address.
+	 *         Takes into account the paused state, cap, and daily mint limit.
+	 * @param receiver Address for which the deposit limit is calculated.
+	 * @return maxAssets Maximum amount of ETH that can be deposited (in Wei).
+	 */
+	function maxDeposit(address receiver) public view override returns (uint256 maxAssets) {
+		if (paused()) return 0;
+		uint256 remainingCap = cap() - totalSupply();
+		uint256 remainingDaily = dailyMintCapAmt > todayMintedShares ? dailyMintCapAmt - todayMintedShares : 0;
+		uint256 minShares = remainingCap < remainingDaily ? remainingCap : remainingDaily;
+		maxAssets = getETHByWrstETH(minShares);
 	}
 }
