@@ -6,12 +6,12 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgrad
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IWrstOracle {
-	function setRateWei(uint256) external;
+	function setRate(uint256) external;
 	function resetDailyCounters() external;
 	function paused() external view returns (bool);
 }
 interface IVaultOracle {
-	function claimReserveWei() external view returns (uint256);
+	function claimReserveEthAmt() external view returns (uint256);
 }
 interface IQueueOracle {
 	function processEth(uint256 availableWei) external;
@@ -35,11 +35,11 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 	IQueueOracle public queue;
 
 	/* ---------------------------- Events ------------------------------ */
-	event AdminProposed(  address indexed oldAdmin,   address indexed newAdmin);
-	event AdminChanged(   address indexed oldAdmin,   address indexed newAdmin);
+	event AdminProposed(address oldAdmin, address newAdmin);
+	event AdminChanged(address oldAdmin, address newAdmin);
 	
-	event KeeperProposed( address indexed oldKeeper,  address indexed newKeeper);
-	event KeeperChanged(  address indexed oldKeeper,  address indexed newKeeper);
+	event KeeperProposed(address oldKeeper, address newKeeper);
+	event KeeperChanged(address oldKeeper, address newKeeper);
 
 	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
@@ -100,18 +100,22 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 	}
 
 	/* ------------------------- Main keeper job ------------------------ */
-	function pushReport(uint256 newRateWei)
+	/**
+	 * @notice Updates the ETH-to-wrstETH conversion rate (ethRate) and releases excess liquidity.
+	 * @param newRate New ETH-to-wrstETH conversion rate.
+	 */
+	function pushReport(uint256 newRate)
 		external
 		onlyRole(KEEPER_ROLE)
 	{
-		/* ---------- Update price & reset daily mint counters ---------- */
-		wrstETHToken.setRateWei(newRateWei);
+		// Update price and reset daily mint counters
+		wrstETHToken.setRate(newRate);
 		wrstETHToken.resetDailyCounters();
 
-		/* ---------- Move excess liquidity to the queue --------------- */
-		if (wrstETHToken.paused()) return;      // bunker mode
+		// Move excess liquidity to the withdrawal queue
+		if (wrstETHToken.paused()) return; // bunker mode
 
-		uint256 free = address(vault).balance - vault.claimReserveWei();
+		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
 		if (free > 0) queue.processEth(free);
 	}
 }
