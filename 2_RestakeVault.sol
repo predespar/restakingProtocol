@@ -46,17 +46,17 @@ contract RestakeVault is
 	IWETH9     public wETH; 
 
 	/* --------------------------- State vars ---------------------------- */
-	uint256 public claimReserveWei;    // Reserved for queued withdrawals
+	uint256 public claimReserveEthAmt;    // Reserved for queued withdrawals
 
 	/* ------------------------------ Events ----------------------------- */
-	event AdminProposed(    address indexed oldAdmin,    address indexed newAdmin);
-	event AdminChanged(     address indexed oldAdmin,    address indexed newAdmin);
+	event AdminProposed(address oldAdmin, address newAdmin);
+	event AdminChanged(address oldAdmin, address newAdmin);
 	
-	event RestakerProposed( address indexed oldRestaker, address indexed newRestaker);
-	event RestakerChanged(  address indexed oldRestaker, address indexed newRestaker);
+	event RestakerProposed(address oldRestaker, address newRestaker);
+	event RestakerChanged(address oldRestaker, address newRestaker);
 
-	event OracleChanged(  address indexed oldOracle,   address indexed newOracle);
-	event QueueChanged(   address indexed oldQueue,    address indexed newQueue);
+	event OracleChanged(address oldOracle, address newOracle);
+	event QueueChanged(address oldQueue, address newQueue);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
@@ -89,59 +89,74 @@ contract RestakeVault is
 	/* ----------------------- Liquidity outflow ------------------------- */
 	/**
 	 * @notice Move assets to a restaking venue.
-	 * @param amountEthWei Amount of ETH (in wei) to withdraw.
+	 * @param ethAmt Amount of ETH to withdraw (in Wei).
 	 */
-	function withdrawForRestaking(uint256 amountEthWei)
+	function withdrawForRestaking(uint256 ethAmt)
 		external
 		nonReentrant
 		wrstETHNotPaused
 		onlyRole(RESTAKER_ROLE)
 	{
 		require(
-			address(this).balance - claimReserveWei >= amountEthWei,
+			address(this).balance - claimReserveEthAmt >= ethAmt,
 			"Vault: insufficient liquidity"
 		);
-		payable(msg.sender).sendValue(amountEthWei);   // reverts on failure
+		payable(msg.sender).sendValue(ethAmt);   // reverts on failure
 	}
 
 	/* ----------------------- Liquidity inflow -------------------------- */
 	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {}
 	
-	function depositFromWrstETH(uint256 wethWei)
+	/**
+	 * @notice Accepts wETH deposits from the wrstETH contract.
+	 *         Unwraps the received wETH into ETH for further restaking.
+	 * @param wethAmt Amount of wETH to deposit (in Wei).
+	 */
+	function depositFromWrstETH(uint256 wethAmt)
 		external
 		nonReentrant
 		onlyRole(WRSTETH_ROLE)
 	{
-		require(wethWei > 0, "Vault: zero wETH");
-		wETH.withdraw(wethWei);
+		require(wethAmt > 0, "Vault: zero wethAmt");
+		// Unwrap wETH into ETH. The resulting ETH will be managed by the vault.
+		wETH.withdraw(wethAmt);
 	}
 
 	/* -------------- Oracle reserve / release management ---------------- */
-	function reserveForClaims(uint256 ethWei)
+	/**
+	 * @notice Reserves ETH for queued withdrawals.
+	 * @param ethAmt Amount of ETH to reserve (in Wei).
+	 */
+	function reserveForClaims(uint256 ethAmt)
 		external onlyRole(ORACLE_ROLE)
-	{ claimReserveWei += ethWei; }
+	{ claimReserveEthAmt += ethAmt; }
 
 	/**
 	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
+	 * @param user The address of the user receiving the funds (ETH/wETH).
+	 * @param ethAmt The amount of ETH to release (in Wei).
+	 * @param wethAmt The amount of wETH to release (in Wei).
 	 */
 	function releaseClaim(
 		address payable user,
-		uint256 ethWei,
-		uint256 wethWei
+		uint256 ethAmt,
+		uint256 wethAmt
 	)
 		external
 		nonReentrant
 		wrstETHNotPaused
 		onlyRole(QUEUE_ROLE)
 	{
-		claimReserveWei -= ethWei + wethWei;
-		// wETH portion first
-		if (wethWei > 0) {
-			wETH.deposit{value: wethWei}();          // wrap
-			wETH.safeTransfer(user, wethWei);
+		// Effects: update state before external calls
+		claimReserveEthAmt -= ethAmt + wethAmt;
+
+		// Convert ETH to wETH if requested
+		// Interactions: external calls after state changes
+		if (wethAmt > 0) {
+			wETH.deposit{value: wethAmt}();
+			wETH.safeTransfer(user, wethAmt);
 		}
-		// ETH portion
-		if (ethWei > 0) user.sendValue(ethWei);      // reverts on failure
+		if (ethAmt > 0) user.sendValue(ethAmt); // reverts on failure
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
@@ -207,7 +222,10 @@ contract RestakeVault is
 	}
 
 	/* --------------------- Receive plain ETH --------------------------- */
-	receive() external payable {
-		revert("Vault: direct ETH transfer not allowed");
-	}
+	/**
+	 * @notice Accepts plain ETH transfers (required for wETH.withdraw()).
+	 *         Leaving this function empty allows the contract to receive ETH from wETH and other contracts.
+	 *         This is the recommended approach for vaults working with wETH.
+	 */
+	receive() external payable {}
 }
