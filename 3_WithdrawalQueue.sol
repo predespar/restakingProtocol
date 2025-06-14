@@ -50,10 +50,9 @@ contract WithdrawalQueue is
 	uint256 public totalReleasedEthOrdersTime; // total time (in seconds) for all processed orders
 
 	/* ------------------------------ Events ----------------------------- */
-	event AdminProposed(address oldAdmin, address newAdmin);
-	event AdminChanged(address oldAdmin, address newAdmin);
-	event OracleChanged(address oldOracle, address newOracle);
-	event Approval(address owner, address spender, uint256 value);
+	event AdminProposed(address indexed oldAdmin, address indexed newAdmin);
+	event AdminChanged( address indexed oldAdmin, address indexed newAdmin);
+	event OracleChanged(address indexed oldOracle, address indexed newOracle);
 
 	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
@@ -72,28 +71,19 @@ contract WithdrawalQueue is
 		wrstETHToken = IWrappedTokenQueue(wrstETHtokenAddr);
 		vault        = IVaultQueue(vaultAddr);
 	}
-
-	/* ------------------------ User: request ETH ----------------------- */
-	/**
-	 * @notice User requests withdrawal of ETH. Mints an NFT ticket with order ID and timestamp.
-	 * @param ethShares Amount of wrstETH shares to withdraw.
-	 * @param receiver Address to receive the NFT ticket.
-	 * @param owner Address of the owner of the shares.
-	 * @return result Array: [orderId, timestamp]
-	 */
-	// --- Withdrawal approvals: owner => spender => amount
 	mapping(address => mapping(address => uint256)) private _withdrawAllowances;
 
 	/**
 	 * @notice Approve `spender` to request withdrawals of up to `amount` wrstETH shares on behalf of `owner`.
 	 *         Analogous to ERC-20 approve.
+	 *         Note: Calling approve repeatedly overwrites the previous value (does not increment or reset to zero first).
 	 * @param spender Address allowed to request withdrawal.
 	 * @param amount Maximum amount of wrstETH shares allowed.
 	 * @return success True if approval succeeded.
 	 */
 	function approve(address spender, uint256 amount) external returns (bool success) {
 		_withdrawAllowances[msg.sender][spender] = amount;
-		emit Approval(msg.sender, spender, amount);
+		emit WithdrawalApproval(msg.sender, spender, amount);
 		return true;
 	}
 
@@ -107,6 +97,17 @@ contract WithdrawalQueue is
 		return _withdrawAllowances[owner][spender];
 	}
 
+	event WithdrawalApproval(address indexed owner, address indexed spender, uint256 value);
+
+	/* ------------------------ User: request ETH ----------------------- */
+	/**
+	 * @notice User requests withdrawal of ETH. Mints an NFT ticket with order ID and timestamp.
+	 * @param ethShares Amount of wrstETH shares to withdraw.
+	 * @param receiver Address to receive the NFT ticket.
+	 * @param owner Address of the owner of the shares.
+	 * @return result Array: [orderId, timestamp]
+	 */
+	// --- Withdrawal approvals: owner => spender => amount
 	function requestWithdrawEth(
 		uint256 ethShares,
 		address receiver,
@@ -123,7 +124,7 @@ contract WithdrawalQueue is
 			unchecked {
 				_withdrawAllowances[owner][msg.sender] = allowed - ethShares;
 			}
-			emit Approval(owner, msg.sender, _withdrawAllowances[owner][msg.sender]);
+			emit WithdrawalApproval(owner, msg.sender, _withdrawAllowances[owner][msg.sender]);
 		}
 
 		uint256 ethWei = wrstETHToken.burnForWithdrawal(ethShares, receiver, owner);
@@ -142,6 +143,7 @@ contract WithdrawalQueue is
 
 		result[0] = id;
 		result[1] = ts;
+		return result;
 	}
 
 	/* --------------------------- User: claim -------------------------- */
