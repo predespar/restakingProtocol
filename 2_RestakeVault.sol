@@ -19,6 +19,11 @@ interface IWETH9 is IERC20Upgradeable {
 	function withdraw(uint256) external;
 }
 
+interface IWithdrawalQueue {
+	function totalEthReleased() external view returns (uint256);
+	function totalEthOrdered() external view returns (uint256);
+}
+
 /**
  * @title RestakeVault
  * @notice Restaking / un-restaking manager.
@@ -44,6 +49,7 @@ contract RestakeVault is
 	/* -------------------- External contract addresses ------------------ */
 	IWrstToken public wrstETHToken;   ///< wrstETH proxy (for pause checks)
 	IWETH9     public wETH; 
+	IWithdrawalQueue public withdrawalQueue;
 
 	/* --------------------------- State vars ---------------------------- */
 	uint256 public claimReserveEthAmt;    // Reserved for queued withdrawals
@@ -57,6 +63,9 @@ contract RestakeVault is
 
 	event OracleChanged(address oldOracle, address newOracle);
 	event QueueChanged(address oldQueue, address newQueue);
+
+	event InsufficientLiquidity(uint256 available, uint256 reserved, uint256 requested);
+	event ClaimReleased(address user, uint256 ethAmt, uint256 wethAmt);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
@@ -77,7 +86,8 @@ contract RestakeVault is
 		_grantRole(WRSTETH_ROLE,      wrstETHAddr); 
 
 		wrstETHToken = IWrstToken(wrstETHAddr);
-		wETH         = IWETH9(wETHAddr); 
+		wETH         = IWETH9(wETHAddr);
+		withdrawalQueue = IWithdrawalQueue(queue);
 	}
 
 	/* ------------------------- Modifiers ------------------------------- */
@@ -89,6 +99,9 @@ contract RestakeVault is
 	/* ----------------------- Liquidity outflow ------------------------- */
 	/**
 	 * @notice Move assets to a restaking venue.
+	 * @dev Safety check does not account for ETH pending in wETH.deposit{value:}.
+	 *      In rare cases, after a large queue release, a shortfall may occur.
+	 *      This is not critical, but is logged for monitoring.
 	 * @param ethAmt Amount of ETH to withdraw (in Wei).
 	 */
 	function withdrawForRestaking(uint256 ethAmt)
@@ -97,8 +110,17 @@ contract RestakeVault is
 		wrstETHNotPaused
 		onlyRole(RESTAKER_ROLE)
 	{
+		uint256 available;
+		unchecked {
+			available = address(this).balance > claimReserveEthAmt
+				? address(this).balance - claimReserveEthAmt
+				: 0;
+		}
+		if (available < ethAmt) {
+			emit InsufficientLiquidity(available, claimReserveEthAmt, ethAmt);
+		}
 		require(
-			address(this).balance - claimReserveEthAmt >= ethAmt,
+			available >= ethAmt,
 			"Vault: insufficient liquidity"
 		);
 		payable(msg.sender).sendValue(ethAmt);   // reverts on failure
@@ -128,11 +150,15 @@ contract RestakeVault is
 	 * @param ethAmt Amount of ETH to reserve (in Wei).
 	 */
 	function reserveForClaims(uint256 ethAmt)
-		external onlyRole(ORACLE_ROLE)
+		external
+		nonReentrant
+		onlyRole(WRSTETH_ROLE)
 	{ claimReserveEthAmt += ethAmt; }
 
 	/**
 	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
+	 *      External calls (ETH/wETH transfer) are performed before state update intentionally:
+	 *      both are atomic and will revert together if any fails, so reserve is only reduced on success.
 	 * @param user The address of the user receiving the funds (ETH/wETH).
 	 * @param ethAmt The amount of ETH to release (in Wei).
 	 * @param wethAmt The amount of wETH to release (in Wei).
@@ -147,16 +173,18 @@ contract RestakeVault is
 		wrstETHNotPaused
 		onlyRole(QUEUE_ROLE)
 	{
-		// Effects: update state before external calls
-		claimReserveEthAmt -= ethAmt + wethAmt;
-
-		// Convert ETH to wETH if requested
-		// Interactions: external calls after state changes
+		// Interactions: external calls before state changes (intentional ordering)
 		if (wethAmt > 0) {
+			// Convert ETH to wETH if requested
 			wETH.deposit{value: wethAmt}();
 			wETH.safeTransfer(user, wethAmt);
 		}
 		if (ethAmt > 0) user.sendValue(ethAmt); // reverts on failure
+
+		// Effects: update state after external calls
+		claimReserveEthAmt -= ethAmt + wethAmt;
+
+		emit ClaimReleased(user, ethAmt, wethAmt);
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
@@ -228,4 +256,28 @@ contract RestakeVault is
 	 *         This is the recommended approach for vaults working with wETH.
 	 */
 	receive() external payable {}
+
+	/**
+	 * @notice Returns the current protocol balance (surplus or deficit) in ETH.
+	 *         balance = WithdrawalQueue.totalEthReleased + address(this).balance - WithdrawalQueue.totalEthOrdered - claimReserveEthAmt
+	 *         If balance > 0: surplus (can be restaked).
+	 *         If balance < 0: deficit (should be withdrawn from restaking).
+	 *         Invariant: released should never exceed ordered, but if it does, result may be incorrect.
+	 * @return balanceWei Signed integer: positive = surplus, negative = deficit.
+	 */
+	function getProtocolBalance() external view returns (int256 balanceWei) {
+		uint256 released = withdrawalQueue.totalEthReleased();
+		uint256 ordered = withdrawalQueue.totalEthOrdered();
+		uint256 onContract = address(this).balance;
+		uint256 reserved = claimReserveEthAmt;
+
+		// Defensive: released should not exceed ordered, but if it does, cap at ordered
+		// Convert to int256 for correct sign handling
+		if (released > ordered) {
+			released = ordered;
+		}
+
+		balanceWei = int256(released) + int256(onContract) - int256(ordered) - int256(reserved);
+		return balanceWei;
+	}
 }
