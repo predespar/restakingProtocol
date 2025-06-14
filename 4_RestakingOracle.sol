@@ -34,6 +34,9 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 	IVaultOracle public vault;
 	IQueueOracle public queue;
 
+	/// @notice Minimum free ETH threshold (in wei) required to trigger a queue transfer.
+	uint256 public minFreeEthToQueue;
+
 	/* ---------------------------- Events ------------------------------ */
 	event AdminProposed(address oldAdmin, address newAdmin);
 	event AdminChanged(address oldAdmin, address newAdmin);
@@ -41,7 +44,17 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 	event KeeperProposed(address oldKeeper, address newKeeper);
 	event KeeperChanged(address oldKeeper, address newKeeper);
 
+	event NewRatePushed(uint256 newRate, uint256 freeToQueue);
+
 	/* ---------------------------- Initializer ------------------------- */
+	/**
+	 * @notice Initializes the RestakingOracle contract.
+	 * @param admin Address to be granted DEFAULT_ADMIN_ROLE.
+	 * @param keeper Address to be granted KEEPER_ROLE.
+	 * @param wrstETHaddr Address of the wrstETH token contract.
+	 * @param vaultAddr Address of the vault contract.
+	 * @param queueAddr Address of the withdrawal queue contract.
+	 */
 	function initialize(
 		address admin,
 		address keeper,
@@ -56,6 +69,17 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 		wrstETHToken = IWrstOracle(wrstETHaddr);
 		vault        = IVaultOracle(vaultAddr);
 		queue        = IQueueOracle(queueAddr);
+
+		minFreeEthToQueue = 32 ether; // Default threshold is 32 ETH
+	}
+
+	/**
+	 * @notice Sets the minimum free ETH threshold for queue transfers.
+	 * @dev Only callable by an account with DEFAULT_ADMIN_ROLE.
+	 * @param minWei The new minimum threshold in wei.
+	 */
+	function setMinFreeEthToQueue(uint256 minWei) external onlyRole(DEFAULT_ADMIN_ROLE) {
+		minFreeEthToQueue = minWei;
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
@@ -112,10 +136,14 @@ contract RestakingOracle is AccessControlEnumerableUpgradeable {
 		wrstETHToken.setRate(newRate);
 		wrstETHToken.resetDailyCounters();
 
-		// Move excess liquidity to the withdrawal queue
-		if (wrstETHToken.paused()) return; // bunker mode
+		// Move excess liquidity to the withdrawal queue if above threshold
+		if (wrstETHToken.paused()) return;
 
 		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
-		if (free > 0) queue.processEth(free);
+		if (free >= minFreeEthToQueue) {
+			queue.processEth(free);
+		}
+
+		emit NewRatePushed(newRate, free);
 	}
 }
