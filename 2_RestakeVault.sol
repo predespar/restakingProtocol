@@ -58,7 +58,8 @@ contract RestakeVault is
 	uint256 public claimReserveEthAmt;    // Reserved for queued withdrawals
 
 	/// @notice Portion of wrstETH totalSupply (in %) to always keep in the vault for fast withdrawals
-	uint256 public withdrawReserve; // e.g. 50 means 2% (1/50)
+	uint16 public withdrawReserve; // e.g. 50 means 2% (1/50)
+	uint256 public lastWithdrawReserveUpdate; // <--- добавлено
 
 	/* ------------------------------ Events ----------------------------- */
 	event AdminProposed(address oldAdmin, address newAdmin);
@@ -69,9 +70,10 @@ contract RestakeVault is
 
 	event OracleChanged(address oldOracle, address newOracle);
 	event QueueChanged(address oldQueue, address newQueue);
+	event WithdrawReserveChanged(uint16 oldReserve, uint16 newReserve); // <--- добавлено
 
 	event InsufficientLiquidity(uint256 available, uint256 reserved, uint256 requested);
-	event ClaimReleased(address user, uint256 ethAmt, uint256 wethAmt);
+	event ClaimReleased(address user, uint256 ethAmt, uint256 wethAmt, bool instant);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
@@ -171,11 +173,13 @@ contract RestakeVault is
 	 * @param user The address of the user receiving the funds (ETH/wETH).
 	 * @param ethAmt The amount of ETH to release (in Wei).
 	 * @param wethAmt The amount of wETH to release (in Wei).
+	 * @param instant True if claim was satisfied instantly (no NFT minted), false if from queue.
 	 */
 	function releaseClaim(
 		address payable user,
 		uint256 ethAmt,
-		uint256 wethAmt
+		uint256 wethAmt,
+		bool instant
 	)
 		external
 		nonReentrant
@@ -193,7 +197,7 @@ contract RestakeVault is
 		// Effects: update state after external calls
 		claimReserveEthAmt -= ethAmt + wethAmt;
 
-		emit ClaimReleased(user, ethAmt, wethAmt);
+		emit ClaimReleased(user, ethAmt, wethAmt, instant);
 	}
 	
 	/* --------------------- Two-phase: RESTAKER ------------------------- */
@@ -235,12 +239,17 @@ contract RestakeVault is
 
 	/**
 	 * @notice Sets the withdrawReserve parameter (portion of wrstETH totalSupply to keep in vault).
+	 *         Can only be called by owner and not more than once per 24 hours.
 	 * @dev Only callable by owner.
 	 * @param reserveDivisor New divisor (e.g. 50 means 2%).
 	 */
 	function setWithdrawReserve(uint256 reserveDivisor) external onlyOwner {
-		require(reserveDivisor >= 1, "Vault: reserveDivisor must be >= 1");
-		withdrawReserve = reserveDivisor;
+		require(block.timestamp >= lastWithdrawReserveUpdate + 24 hours, "Vault: update too soon");
+		require(reserveDivisor >= 1 && reserveDivisor <= type(uint16).max, "Vault: reserveDivisor must be 1..65535");
+		uint16 oldReserve = withdrawReserve;
+		withdrawReserve = uint16(reserveDivisor);
+		lastWithdrawReserveUpdate = block.timestamp;
+		emit WithdrawReserveChanged(oldReserve, withdrawReserve);
 	}
 
 	/* --------------------- Receive plain ETH --------------------------- */
