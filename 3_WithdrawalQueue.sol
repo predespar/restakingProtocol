@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 /* ───────────────────────── OpenZeppelin upgradeable ───────────────────────── */
 import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
@@ -23,14 +24,12 @@ interface IVaultQueue {
  */
 contract WithdrawalQueue is
 	ERC721Upgradeable,
+	Ownable2StepUpgradeable,
 	AccessControlEnumerableUpgradeable,
 	ReentrancyGuardUpgradeable
 {
 	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
-
-	/* ------------------------- Pending admin --------------------------- */
-	address public pendingAdmin;
 
 	/* ------------------------- External links ------------------------- */
 	IWrappedTokenQueue public wrstETHToken;
@@ -62,11 +61,12 @@ contract WithdrawalQueue is
 		address vaultAddr
 	) external initializer {
 		__ERC721_init("wrstETH Withdrawal Ticket", "wrsETHNFT");
+		__Ownable2Step_init();
 		__AccessControlEnumerable_init();
 		__ReentrancyGuard_init();
 
-		_grantRole(DEFAULT_ADMIN_ROLE, admin);
-		_grantRole(ORACLE_ROLE,       oracle);
+		_transferOwnership(admin);
+		_grantRole(ORACLE_ROLE, oracle);
 
 		wrstETHToken = IWrappedTokenQueue(wrstETHtokenAddr);
 		vault        = IVaultQueue(vaultAddr);
@@ -99,22 +99,23 @@ contract WithdrawalQueue is
 
 	event WithdrawalApproval(address indexed owner, address indexed spender, uint256 value);
 
-	/* ------------------------ User: request ETH ----------------------- */
+	/* ------------------------ User: try withdraw ETH ----------------------- */
 	/**
-	 * @notice User requests withdrawal of ETH. Mints an NFT ticket with order ID and timestamp.
+	 * @notice Requests withdrawal of ETH and attempts to immediately claim if possible.
+	 *         If enough liquidity is available, user receives ETH/wETH instantly and no NFT is minted.
+	 *         Otherwise, an NFT ticket is minted and user waits for their turn in the queue.
 	 * @param ethShares Amount of wrstETH shares to withdraw.
-	 * @param receiver Address to receive the NFT ticket.
+	 * @param receiver Address to receive the NFT ticket or ETH/wETH.
 	 * @param owner Address of the owner of the shares.
-	 * @return result Array: [orderId, timestamp]
+	 * @param wETHamt Amount of wETH user wants to receive (0 – all ETH).
+	 * @return result Array: [NFT id (0 if claimed instantly), timestamp, ETH claimed, wETH claimed]
 	 */
-	// --- Withdrawal approvals: owner => spender => amount
-	function requestWithdrawEth(
+	function tryWithdraw(
 		uint256 ethShares,
 		address receiver,
-		address owner
-	)
-		external returns (uint256[2] memory result)
-	{
+		address owner,
+		uint256 wETHamt
+	) external nonReentrant returns (uint256[4] memory result) {
 		require(!wrstETHToken.paused(),            "Queue: paused");
 		require(!wrstETHToken.isFrozen(receiver),  "Queue: frozen");
 		require(!wrstETHToken.isFrozen(owner),     "Queue: frozen");
@@ -129,7 +130,6 @@ contract WithdrawalQueue is
 
 		uint256 ethWei = wrstETHToken.burnForWithdrawal(ethShares, receiver, owner);
 
-		// cumulative counters (ETH) with overflow check
 		require(totalEthOrdered <= type(uint256).max - ethWei, "Queue: totalEthOrdered overflow");
 		totalEthOrdered += ethWei;
 		unchecked { ++totalEthOrders; }
@@ -139,10 +139,41 @@ contract WithdrawalQueue is
 		ethOrders[id] = ethWei;
 		ethOrderTimestamps[id] = ts;
 
-		_mint(receiver, id);
+		// Try to advance the queue with current free liquidity
+		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
+		if (free > 0) {
+			this.processEth(free);
+		}
 
+		// If claim is ready, immediately process and return funds, no NFT minted
+		if (id <= totalEthReleased && ethOrders[id] > 0) {
+			uint256 amt = ethOrders[id];
+			require(amt >= wETHamt, "Queue: wETH value exceeded");
+
+			// Calculate and accumulate processing time before deleting timestamp
+			totalReleasedEthOrdersTime += block.timestamp - ethOrderTimestamps[id];
+
+			delete ethOrders[id];
+			delete ethOrderTimestamps[id];
+			unchecked { ++totalReleasedEthOrders; }
+
+			uint256 ethAmt = amt - wETHamt;
+			vault.releaseClaim(payable(receiver), ethAmt, wETHamt);
+
+			// No NFT minted, return [0, timestamp, ETH, wETH]
+			result[0] = 0;
+			result[1] = ts;
+			result[2] = ethAmt;
+			result[3] = wETHamt;
+			return result;
+		}
+
+		// Otherwise, mint NFT and return [id, timestamp, 0, 0]
+		_mint(receiver, id);
 		result[0] = id;
 		result[1] = ts;
+		result[2] = 0;
+		result[3] = 0;
 		return result;
 	}
 
@@ -151,7 +182,7 @@ contract WithdrawalQueue is
 	 * @param id       NFT ticket id
 	 * @param wETHamt  How much of the total should be received in wETH (0 – all ETH)
 	 */
-	function claimEth(uint256 id, uint256 wETHamt) external nonReentrant {
+	function claimEth(uint256 id, uint256 wETHamt) external nonReentrant returns (uint256[4] memory result) {
 		require(!wrstETHToken.paused(),              "Queue: paused");
 		require(ownerOf(id) == msg.sender,           "Queue: !owner");
 		require(!wrstETHToken.isFrozen(msg.sender),  "Queue: frozen");
@@ -161,8 +192,10 @@ contract WithdrawalQueue is
 		require(amt > 0, "Queue: already claimed");
 		require(amt >= wETHamt, "Queue: wETH value exceeded");
 
+		uint256 ts = ethOrderTimestamps[id];
+
 		// Calculate and accumulate processing time before deleting timestamp
-		totalReleasedEthOrdersTime += block.timestamp - ethOrderTimestamps[id];
+		totalReleasedEthOrdersTime += block.timestamp - ts;
 
 		delete ethOrders[id];
 		delete ethOrderTimestamps[id];
@@ -171,43 +204,38 @@ contract WithdrawalQueue is
 		_burn(id);
 		uint256 ethAmt = amt - wETHamt;
 		vault.releaseClaim(payable(msg.sender), ethAmt, wETHamt);
+
+		result[0] = id;
+		result[1] = ts;
+		result[2] = ethAmt;
+		result[3] = wETHamt;
+		return result;
 	}
 
 	/* ---------------- Oracle: release ETH liquidity ------------------- */
 	/**
-	 * @notice Processes ETH liquidity released by the oracle.
+	 * @notice Processes ETH liquidity released by the oracle or deposit logic.
+	 *         Only the required amount for pending withdrawals is reserved; excess is ignored.
 	 * @param availableEthAmt Amount of ETH available for release (in Wei).
 	 */
 	function processEth(uint256 availableEthAmt)
-		external onlyRole(ORACLE_ROLE)
+		external
+		onlyRole(ORACLE_ROLE)
 	{
-		require(totalEthReleased <= type(uint256).max - availableEthAmt, "Queue: totalEthReleased overflow");
-		totalEthReleased += availableEthAmt;
+		uint256 pending = totalEthOrdered > totalEthReleased
+			? totalEthOrdered - totalEthReleased
+			: 0;
+		uint256 toRelease = availableEthAmt < pending ? availableEthAmt : pending;
+		require(totalEthReleased <= type(uint256).max - toRelease, "Queue: totalEthReleased overflow");
+		if (toRelease > 0) {
+			totalEthReleased += toRelease;
+		}
+		// Any excess (availableEthAmt > pending) is not reserved and remains available for restaking.
 	}
 	
-	/* --------------------- Two-phase admin rotation ------------------- */
-	function proposeAdmin(address newAdmin)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newAdmin != address(0), "Queue: zero admin");
-		pendingAdmin = newAdmin;
-		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
-	}
-
-	function acceptAdmin() external {
-		require(msg.sender == pendingAdmin, "Queue: not pending admin");
-		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
-
-		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
-		_revokeRole(DEFAULT_ADMIN_ROLE, old);
-
-		emit AdminChanged(old, pendingAdmin);
-		pendingAdmin = address(0);
-	}
-
 	/* ---------------------- One-step oracle rotation ------------------ */
 	function setOracle(address newOracle)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
+		external onlyOwner
 	{
 		require(newOracle != address(0), "Queue: zero oracle");
 		address old = getRoleMember(ORACLE_ROLE, 0);
@@ -241,6 +269,15 @@ contract WithdrawalQueue is
 	function getAverageDailyPayout() public view returns (uint256) {
 		if (totalReleasedEthOrdersTime == 0) return 0;
 		return totalEthOrdered * 1 days / totalReleasedEthOrdersTime;
+	}
+
+	/**
+	 * @notice Returns true if the withdrawal ticket is ready to be claimed (i.e., its id is released).
+	 * @param id NFT ticket id.
+	 * @return ready True if claimEth can be called for this id, false otherwise.
+	 */
+	function isClaimReady(uint256 id) external view returns (bool ready) {
+		return id <= totalEthReleased && ethOrders[id] > 0;
 	}
 
 	/**
