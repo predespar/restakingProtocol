@@ -1,46 +1,59 @@
 ## Core Contracts
 
 ### 1. WrstETH (Wrapped Restaked ETH)
-- **ERC-4626** compatible token representing a user's share in restaked ETH.
+- **ERC-4626** compliant token representing a user's share in restaked ETH.
 - Supports deposits in ETH and wETH, minting and burning of wrstETH.
-- Limits: supply cap, daily mint cap, freeze/pausable mechanisms.
-- wrstETH/ETH rate is updated via Oracle with fixed-point 64.64 protection against sharp changes.
-- Two-step role rotation for admin/freezer/pauser, single-step for oracle/queue.
+- Supply cap, daily mint cap, pausable and freeze mechanisms.
+- Oracle-controlled rate with daily increase protection; maximum annual rate is owner-configurable.
+- Withdrawal discount is calculated based on the current `MAX_ANNUAL_RATE` and reflected in `previewWithdraw`/`previewRedeem` (ERC-4626 preview functions).
+- Two-step ownership transfer (`Ownable2StepUpgradeable`).
+- Minimal roles: `ORACLE_ROLE` and `QUEUE_ROLE` for integrations.
 - Permit2 support for gasless deposits.
 - All transfers and operations are blocked for frozen accounts.
+- Emits events on all critical parameter changes (including `MaxAnnualRateChanged`).
 
 ### 2. RestakeVault
 - Manages ETH reserves for the withdrawal queue and restaking operations.
 - Accepts ETH/wETH, releases funds for restaking and withdrawal claims.
-- Reentrancy protection (nonReentrant).
-- Reserves claimReserveEthAmt for the withdrawal queue.
-- Two-step role rotation for admin/restaker, single-step for oracle/queue.
+- Reentrancy protection (`nonReentrant`).
+- Reserves `claimReserveEthAmt` for the withdrawal queue.
+- Two-step ownership transfer (`Ownable2StepUpgradeable`).
+- `RESTAKER_ROLE` rotation is two-step (propose/accept).
+- Owner can set the fast withdrawal reserve (`withdrawReserve`, `uint16`), emits `WithdrawReserveChanged` on update.
+- Surplus calculation and logic for restaking excess funds.
 
 ### 3. WithdrawalQueue
-- Withdrawal requests are represented as NFTs (ERC-721), each request is a separate NFT.
+- Withdrawal requests are represented as ERC-721 NFTs (one per request).
 - FIFO logic via cumulative id, O(1) operations, no loops.
 - Users can delegate withdrawal rights via approve/allowance (ERC-20 style).
-- NFT metadata is implemented via on-chain tokenURI (base64 JSON).
+- NFT metadata is implemented via on-chain `tokenURI` (base64 JSON).
 - Overflow protection for counters.
-- EIP-165 (supportsInterface) supported.
+- EIP-165 (`supportsInterface`) supported.
+- Users can attempt instant withdrawal with `tryWithdraw`; if not possible, an NFT is minted and the user waits in the queue.
+- `isClaimReady(id)` returns both readiness and claim status for a withdrawal ticket.
+- Emits `QueueVaultState` after each queue processing, including queue size, free liquidity, surplus, and `totalEthReleased`.
 
 ### 4. RestakingOracle
 - Keeper contract that updates the wrstETH/ETH rate and releases liquidity for the queue.
-- Two-step role rotation for admin/keeper.
+- Two-step ownership transfer (`Ownable2StepUpgradeable`).
+- `KEEPER_ROLE` rotation is two-step (propose/accept).
 - All calls are strictly role-restricted.
+- Emits `NewRatePushed` on each report.
 
 ## Security & Optimization
 
-- All critical external calls are protected by nonReentrant and checks-effects-interactions.
-- All variables and events are gas-optimized (indexed only where needed).
+- All critical external calls are protected by `nonReentrant` and checks-effects-interactions.
+- All variables and events are gas-optimized (indexed only where needed, minimal storage types like `uint16` for `withdrawReserve`).
 - DoS protection by gas (no loops in main functions).
 - Overflow checks for cumulative counters.
-- Frozen flags stored as mapping(address => bool) — standard and safe.
+- Frozen flags stored as `mapping(address => bool)` — standard and safe.
 - Permit2 address stored as immutable (set via assembly in initialize).
 
 ## Features
 
-- All roles and access rights implemented via OpenZeppelin AccessControlEnumerableUpgradeable.
-- All contracts are upgradeable (Initializable).
+- All roles and access rights implemented via OpenZeppelin `AccessControlEnumerableUpgradeable`.
+- All contracts are upgradeable (`Initializable`).
 - Support for both off-chain and on-chain NFT metadata.
 - Integration with external services (e.g., Uniswap Permit2, OpenSea) is possible.
+- All key protocol state changes are reflected in events for off-chain monitoring and integrations.
+
