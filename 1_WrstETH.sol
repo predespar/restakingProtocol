@@ -6,6 +6,7 @@ import "@openzeppelin/contracts-upgradeable/token/ERC4626/ERC4626Upgradeable.sol
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20CappedUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20BurnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
@@ -63,6 +64,7 @@ contract WrstETH is
 	ERC20CappedUpgradeable,
 	ERC20BurnableUpgradeable,
 	ERC20PermitUpgradeable,
+	Ownable2StepUpgradeable,
 	AccessControlEnumerableUpgradeable,
 	PausableUpgradeable,
 	ReentrancyGuardUpgradeable
@@ -71,12 +73,8 @@ contract WrstETH is
 	using SafeERC20Upgradeable for IERC20Upgradeable;
 
 	/* ------------------------------ Roles ------------------------------ */
-	bytes32 public constant FREEZER_ROLE       = keccak256("FREEZER_ROLE");
-	bytes32 public constant PAUSER_ROLE        = keccak256("PAUSER_ROLE");
-	bytes32 public constant CAP_MANAGER_ROLE   = keccak256("CAP_MANAGER_ROLE");
-	bytes32 public constant LIMIT_MANAGER_ROLE = keccak256("LIMIT_MANAGER_ROLE");
-	bytes32 public constant ORACLE_ROLE        = keccak256("ORACLE_ROLE");
-	bytes32 public constant QUEUE_ROLE         = keccak256("QUEUE_ROLE");
+	bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+	bytes32 public constant QUEUE_ROLE  = keccak256("QUEUE_ROLE");
 
 	/* ------------------------------ Storage ---------------------------- */
 	IRestakeVault 		public vault;         ///< Restake vault that manages restaking/unrestaking
@@ -96,11 +94,6 @@ contract WrstETH is
 	uint8   public dailyPercent;            ///< Percent of cap allowed per UTC day
 
 	mapping(address => bool) private _frozen;   ///< Sanctions / fraud freeze list
-
-	/* ---------- pending addresses for two-phase role rotation ---------- */
-	address public pendingAdmin;
-	address public pendingFreezer;
-	address public pendingPauser;
 
 	/* --------------------------- Rate update protection ---------------- */
 	// Use 64.64 fixed-point math for precision (Q64.64)
@@ -151,8 +144,6 @@ contract WrstETH is
 	/* ------------------------------ Initializer ------------------------ */
 	/**
 	 * @param admin         DEFAULT_ADMIN_ROLE
-	 * @param freezer       FREEZER_ROLE
-	 * @param pauser        PAUSER_ROLE
 	 * @param oracle        ORACLE_ROLE
 	 * @param queue         QUEUE_ROLE & WithdrawalQueue address
 	 * @param vaultAddr     RestakeVault address
@@ -162,8 +153,6 @@ contract WrstETH is
 	 */
 	function initialize(
 		address admin,
-		address freezer,
-		address pauser,
 		address oracle,
 		address queue,
 		address vaultAddr,
@@ -176,17 +165,14 @@ contract WrstETH is
 		__ERC4626_init(IERC20Upgradeable(wETHAddr), "Wrapped Restaked ETH", "wrstETH");
 		__ERC20Capped_init(capAmt);
 		__ERC20Permit_init("Wrapped Restaked ETH");
+		__Ownable2Step_init();
 		__AccessControlEnumerable_init();
 		__Pausable_init();
 		__ReentrancyGuard_init();
 
-		_grantRole(DEFAULT_ADMIN_ROLE, admin);
-		_grantRole(FREEZER_ROLE,       freezer);
-		_grantRole(PAUSER_ROLE,        pauser);
-		_grantRole(CAP_MANAGER_ROLE,   admin);
-		_grantRole(LIMIT_MANAGER_ROLE, admin);
-		_grantRole(ORACLE_ROLE,        oracle);
-		_grantRole(QUEUE_ROLE,         queue);
+		_transferOwnership(admin);
+		_grantRole(ORACLE_ROLE, oracle);
+		_grantRole(QUEUE_ROLE, queue);
 
 		vault           = IRestakeVault(vaultAddr);
 		withdrawalQueue = IWithdrawalQueue(queue);
@@ -205,17 +191,17 @@ contract WrstETH is
 	}
 
 	/* ------------------------------ Pause / Freeze --------------------- */
-	function pause()   external onlyRole(PAUSER_ROLE)  { _pause();  }
-	function unpause() external onlyRole(PAUSER_ROLE)  { _unpause();}
+	function pause()   external onlyOwner { _pause(); }
+	function unpause() external onlyOwner { _unpause(); }
 
-	function freeze(address account)   external onlyRole(FREEZER_ROLE) {
+	function freeze(address account)   external onlyOwner {
 		_frozen[account] = true;
 		emit Frozen(account);
 	}
-	function unfreeze(address account) external onlyRole(FREEZER_ROLE) {
+	function unfreeze(address account) external onlyOwner {
 		_frozen[account] = false; emit Unfrozen(account);
 	}
-	function confiscate(address account) external onlyRole(FREEZER_ROLE) {
+	function confiscate(address account) external onlyOwner {
 		require(_frozen[account], "wrstETH: not frozen");
 		uint256 bal = balanceOf(account);
 		_burn(account, bal);
@@ -230,7 +216,7 @@ contract WrstETH is
 	 *      deposits while allowing withdrawals.
 	 * @param newCapAmt New total supply cap (in Wei).
 	 */
-	function setCap(uint256 newCapAmt) external onlyRole(CAP_MANAGER_ROLE) {
+	function setCap(uint256 newCapAmt) external onlyOwner {
 		require(newCapAmt > 0, "wrstETH: cap 0");
 		emit CapChanged(cap(), newCapAmt);
 		_updateCap(newCapAmt);
@@ -239,7 +225,7 @@ contract WrstETH is
 		dailyMintCapAmt = newCapAmt * dailyPercent / 100;
 	}
 
-	function setDailyPercent(uint8 percent) external onlyRole(LIMIT_MANAGER_ROLE) {
+	function setDailyPercent(uint8 percent) external onlyOwner {
 		require(percent >= 1 && percent <= 100, "wrstETH: bad %");
 		dailyPercent    = percent;
 		dailyMintCapAmt = cap() * percent / 100;
@@ -249,7 +235,7 @@ contract WrstETH is
 	/* ------------------------ Role rotation (admin) -------------------- */
 	/* ---------------- One-step rotation: ORACLE & QUEUE ---------------- */
 	function setOracle(address newOracle)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
+		external onlyOwner
 	{
 		require(newOracle != address(0), "wrstETH: zero oracle");
 		address old = getRoleMember(ORACLE_ROLE, 0);
@@ -259,72 +245,13 @@ contract WrstETH is
 	}
 
 	function setQueue(address newQueue)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
+		external onlyOwner
 	{
 		require(newQueue != address(0), "wrstETH: zero queue");
 		address old = getRoleMember(QUEUE_ROLE, 0);
 		_grantRole(QUEUE_ROLE, newQueue);
 		_revokeRole(QUEUE_ROLE, old);
 		emit QueueChanged(old, newQueue);
-	}
-	/* ------------------------- Two-phase: ADMIN ------------------------ */
-	function proposeAdmin(address newAdmin)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newAdmin != address(0), "wrstETH: zero admin");
-		pendingAdmin = newAdmin;
-		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
-	}
-	
-	function acceptAdmin() external {
-		require(msg.sender == pendingAdmin, "wrstETH: not pending admin");
-		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
-	
-		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
-		_revokeRole(DEFAULT_ADMIN_ROLE, old);
-	
-		emit AdminChanged(old, pendingAdmin);
-		pendingAdmin = address(0);
-	}
-	
-	/* ------------------------- Two-phase: FREEZER ---------------------- */
-	function proposeFreezer(address newFreezer)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newFreezer != address(0), "wrstETH: zero freezer");
-		pendingFreezer = newFreezer;
-		emit FreezerProposed(getRoleMember(FREEZER_ROLE, 0), newFreezer);
-	}
-	
-	function acceptFreezer() external {
-		require(msg.sender == pendingFreezer, "wrstETH: not pending freezer");
-		address old = getRoleMember(FREEZER_ROLE, 0);
-	
-		_grantRole(FREEZER_ROLE, pendingFreezer);
-		_revokeRole(FREEZER_ROLE, old);
-	
-		emit FreezerChanged(old, pendingFreezer);
-		pendingFreezer = address(0);
-	}
-	
-	/* ------------------------- Two-phase: PAUSER ----------------------- */
-	function proposePauser(address newPauser)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newPauser != address(0), "wrstETH: zero pauser");
-		pendingPauser = newPauser;
-		emit PauserProposed(getRoleMember(PAUSER_ROLE, 0), newPauser);
-	}
-	
-	function acceptPauser() external {
-		require(msg.sender == pendingPauser, "wrstETH: not pending pauser");
-		address old = getRoleMember(PAUSER_ROLE, 0);
-	
-		_grantRole(PAUSER_ROLE, pendingPauser);
-		_revokeRole(PAUSER_ROLE, old);
-	
-		emit PauserChanged(old, pendingPauser);
-		pendingPauser = address(0);
 	}
 
 	/* --------------------------- Math helpers -------------------------- */
@@ -425,6 +352,12 @@ contract WrstETH is
 		wETH.safeTransfer(address(vault), assetsToRestake);
 		// The vault will unwrap wETH into ETH upon receiving it. (external)
 		vault.depositFromWrstETH(assetsToRestake);
+
+		// try to advance withdrawal queue if there is free liquidity ---
+		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
+		if (free > 0) {
+			withdrawalQueue.processEth(free);
+		}
 
 		emit Deposit(msg.sender, owner, receiver, totalAssetAmt - refundEthAmt, shares);
 		return (shares, refundEthAmt);
