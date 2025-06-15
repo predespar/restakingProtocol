@@ -96,9 +96,8 @@ contract WrstETH is
 	mapping(address => bool) private _frozen;   ///< Sanctions / fraud freeze list
 
 	/* --------------------------- Rate update protection ---------------- */
-	// Use 64.64 fixed-point math for precision (Q64.64)
-	uint128 private constant MAX_ANNUAL_RATE_INCREASE_64x64 = 0x199999999999999A; // ≈0.2 in 64.64 (0.2 * 2^64)
-	uint128 private constant MAX_DAILY_RATE_INCREASE_64x64 = MAX_ANNUAL_RATE_INCREASE_64x64 / 365; // 0.2/365 * 1e18
+	// Use 2 decimals precision for annual rate (e.g. 1000 = 10.00%)
+	uint16 public MAX_ANNUAL_RATE; // in basis points, 2 decimals (e.g. 1000 = 10.00%)
 
 	/* --------------------------- constants ---------------------------- */
 	// Permit2 address is the same on Ethereum, Polygon, Arbitrum, Optimism, Gnosis, etc.
@@ -112,6 +111,7 @@ contract WrstETH is
 	event CapChanged(uint256 oldCapAmt, uint256 newCapAmt);
 	event DailyCapChanged(uint256 newDailyCap);
 	event RateChanged(uint256 oldRate, uint256 newRate);
+	event MaxAnnualRateChanged(uint16 oldRate, uint16 newRate); // <--- добавлено
 
 	event AdminProposed(address oldAdmin, address newAdmin);
 	event AdminChanged(address oldAdmin, address newAdmin);
@@ -182,6 +182,7 @@ contract WrstETH is
 		dailyPercent    = _dailyPercent;
 		dailyMintCapAmt = capAmt * dailyPercent / 100;
 		currentDay      = uint64(block.timestamp / 1 days);
+		MAX_ANNUAL_RATE = 1000; // default: 10.00%
 	}
 
 	/* ───────────────────────── Modifiers ───────────────────────────── */
@@ -260,6 +261,29 @@ contract WrstETH is
 	}
 	function getETHByWrstETH(uint256 wrstEthAmt) public view returns (uint256) {
 		return wrstEthAmt * ethRate / 1e18;
+	}
+
+	/**
+	 * @notice Returns the amount of assets that would be received for redeeming the given number of shares,
+	 *         taking into account the withdrawal discount.
+	 * @param shares Amount of shares to redeem.
+	 * @return Amount of assets receivable after discount.
+	 */
+	function previewRedeem(uint256 shares) public view override returns (uint256) {
+		return previewWithdraw(shares);
+	}
+
+	/**
+	 * @notice Returns the amount of assets that would be withdrawn for burning the given number of shares,
+	 *         taking into account the withdrawal discount.
+	 * @param shares Amount of shares to withdraw.
+	 * @return Amount of assets receivable after discount.
+	 */
+	function previewWithdraw(uint256 shares) public view override returns (uint256) {
+		// MAX_ANNUAL_RATE is now uint16, with 2 decimals (e.g. 1000 = 10.00%)
+		// Daily rate = MAX_ANNUAL_RATE / 10000 / 365
+		uint256 discount = ethRate * uint256(MAX_ANNUAL_RATE) / 10000 / 365;
+		return shares * (ethRate - discount) / 1e18;
 	}
 
 	/* --------------------- Transfer guard overrides -------------------- */
@@ -638,14 +662,21 @@ contract WrstETH is
 
 	/* ------------------------------ Burn ------------------------------- */
 	/**
-	 * @dev Burn tokens when `WithdrawalQueue` prepares a withdrawal.
-	 *      Only callable by the queue contract.
+	 * @dev Burns wrstETH shares and reserves ETH for withdrawal.
+	 *      Applies a discount equal to the maximum possible daily rate increase to protect the protocol from instant withdrawal arbitrage.
+	 *      The user receives ETH as if the rate were reduced by the maximum allowed daily increase.
+	 *      Only callable by the withdrawal queue contract.
+	 * @param wrstEthAmt Amount of wrstETH shares to burn.
+	 * @param receiver Address to receive the withdrawal (for event/logging).
+	 * @param owner Address of the owner of the shares being burned.
+	 * @return ethAmt Amount of ETH reserved for withdrawal (discounted).
 	 */
 	function burnForWithdrawal(uint256 wrstEthAmt, address receiver, address owner)
 		external onlyRole(QUEUE_ROLE)
 		returns (uint256 ethAmt)
 	{
-		ethAmt = getETHByWrstETH(wrstEthAmt);
+		// Discount: user receives ETH as if the rate were reduced by the maximum allowed daily increase
+		ethAmt = previewWithdraw(wrstEthAmt);
 		_burn(owner, wrstEthAmt);
 		vault.reserveForClaims(ethAmt);
 		emit Withdraw(msg.sender, receiver, owner, ethAmt, wrstEthAmt);
@@ -665,7 +696,7 @@ contract WrstETH is
 
 		// Calculate max allowed rate using 64.64 fixed-point math
 		// maxAllowedRate = ethRate + ethRate * MAX_DAILY_RATE_INCREASE_64x64 >> 64
-		uint256 maxAllowedRate = ethRate + (ethRate * uint256(MAX_DAILY_RATE_INCREASE_64x64) >> 64);
+		uint256 maxAllowedRate = ethRate + ethRate * uint256(MAX_ANNUAL_RATE) / 10000 / 365;
 		require(newRate <= maxAllowedRate, "wrstETH: rate increase too high");
 
 		// Update the rate and timestamp
@@ -709,5 +740,17 @@ contract WrstETH is
 	 */
 	function convertToAssets(uint256 shares) public view override returns (uint256) {
 		return getETHByWrstETH(shares);
+	}
+
+	/**
+	 * @notice Sets the maximum allowed annual rate (basis points, 2 decimals).
+	 *         Only callable by owner.
+	 * @param newAnnualRate New max annual rate (e.g. 1000 = 10.00%).
+	 */
+	function setMaxAnnualRate(uint16 newAnnualRate) external onlyOwner {
+		require(newAnnualRate >= 0 && newAnnualRate <= 2500, "wrstETH: invalid max rate"); // sanity check, max 25%
+		uint16 oldRate = MAX_ANNUAL_RATE;
+		MAX_ANNUAL_RATE = newAnnualRate;
+		emit MaxAnnualRateChanged(oldRate, newAnnualRate);
 	}
 }
