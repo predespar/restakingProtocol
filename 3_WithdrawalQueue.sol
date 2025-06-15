@@ -14,7 +14,7 @@ interface IWrappedTokenQueue {
 	function isFrozen(address) external view returns (bool);
 }
 interface IVaultQueue {
-	function releaseClaim(address payable, uint256 ethWei, uint256 wethWei) external;
+	function releaseClaim(address payable, uint256 ethWei, uint256 wethWei, bool instant) external;
 }
 
 /**
@@ -52,6 +52,20 @@ contract WithdrawalQueue is
 	event AdminProposed(address indexed oldAdmin, address indexed newAdmin);
 	event AdminChanged( address indexed oldAdmin, address indexed newAdmin);
 	event OracleChanged(address indexed oldOracle, address indexed newOracle);
+
+	/**
+	 * @dev Emitted after processEth with current queue, free liquidity, surplus, and totalEthReleased.
+	 * @param queueSize Amount of ETH in the withdrawal queue (totalEthOrdered - totalEthReleased)
+	 * @param freeLiquidity Amount of ETH available for instant withdrawal (address(vault).balance - vault.claimReserveEthAmt())
+	 * @param surplus Surplus/deficit in the vault (see RestakeVault logic)
+	 * @param totalEthReleased Current value of totalEthReleased (top of the queue)
+	 */
+	event QueueVaultState(
+		uint256 queueSize,
+		uint256 freeLiquidity,
+		int256 surplus,
+		uint256 totalEthReleased
+	);
 
 	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
@@ -158,7 +172,7 @@ contract WithdrawalQueue is
 			unchecked { ++totalReleasedEthOrders; }
 
 			uint256 ethAmt = amt - wETHamt;
-			vault.releaseClaim(payable(receiver), ethAmt, wETHamt);
+			vault.releaseClaim(payable(receiver), ethAmt, wETHamt, true); // instant = true
 
 			// No NFT minted, return [0, timestamp, ETH, wETH]
 			result[0] = 0;
@@ -203,7 +217,7 @@ contract WithdrawalQueue is
 
 		_burn(id);
 		uint256 ethAmt = amt - wETHamt;
-		vault.releaseClaim(payable(msg.sender), ethAmt, wETHamt);
+		vault.releaseClaim(payable(msg.sender), ethAmt, wETHamt, false); // instant = false
 
 		result[0] = id;
 		result[1] = ts;
@@ -231,6 +245,31 @@ contract WithdrawalQueue is
 			totalEthReleased += toRelease;
 		}
 		// Any excess (availableEthAmt > pending) is not reserved and remains available for restaking.
+
+		// --- Emit QueueVaultState event ---
+		uint256 queueSize = totalEthOrdered - totalEthReleased;
+		uint256 freeLiquidity = address(vault).balance - vault.claimReserveEthAmt();
+
+		// Calculate surplus as in RestakeVault
+		uint256 fastReserve = 0;
+		uint256 withdrawReserve = 0;
+		try vault.withdrawReserve() returns (uint256 wr) {
+			withdrawReserve = wr;
+		} catch {}
+		if (withdrawReserve > 0) {
+			uint256 totalSupply = 0;
+			try wrstETHToken.totalSupply() returns (uint256 ts) {
+				totalSupply = ts;
+			} catch {}
+			uint256 reserveShares = totalSupply / withdrawReserve;
+			try wrstETHToken.getETHByWrstETH(reserveShares) returns (uint256 fr) {
+				fastReserve = fr;
+			} catch {}
+		}
+		uint256 minBalance = vault.claimReserveEthAmt() + fastReserve;
+		int256 surplus = int256(address(vault).balance) - int256(minBalance);
+
+		emit QueueVaultState(queueSize, freeLiquidity, surplus, totalEthReleased);
 	}
 	
 	/* ---------------------- One-step oracle rotation ------------------ */
@@ -272,12 +311,15 @@ contract WithdrawalQueue is
 	}
 
 	/**
-	 * @notice Returns true if the withdrawal ticket is ready to be claimed (i.e., its id is released).
+	 * @notice Returns the claim status for a withdrawal ticket.
 	 * @param id NFT ticket id.
-	 * @return ready True if claimEth can be called for this id, false otherwise.
+	 * @return ready True if claimEth can be called for this id (id released and not yet claimed).
+	 * @return alreadyClaimed True if the claim was already processed (id released and already claimed).
 	 */
-	function isClaimReady(uint256 id) external view returns (bool ready) {
-		return id <= totalEthReleased && ethOrders[id] > 0;
+	function isClaimReady(uint256 id) external view returns (bool ready, bool alreadyClaimed) {
+		bool released = id <= totalEthReleased;
+		bool exists = ethOrders[id] > 0;
+		return (released, exists);
 	}
 
 	/**
