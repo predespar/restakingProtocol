@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 /* ───────────────────────── OpenZeppelin upgradeable ───────────────────────── */
 import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
@@ -11,6 +12,8 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeab
 /* ──────────────────────────── External interfaces ─────────────────────────── */
 interface IWrstToken {
 	function paused() external view returns (bool);
+	function totalSupply() external view returns (uint256);
+	function getETHByWrstETH(uint256 wrstEthAmt) external view returns (uint256);
 }
 
 // --- WETH9 minimal interface ---
@@ -29,6 +32,7 @@ interface IWithdrawalQueue {
  * @notice Restaking / un-restaking manager.
  */
 contract RestakeVault is
+	Ownable2StepUpgradeable,
 	AccessControlEnumerableUpgradeable,
 	ReentrancyGuardUpgradeable
 {
@@ -43,7 +47,6 @@ contract RestakeVault is
 	bytes32 public constant WRSTETH_ROLE   = keccak256("WRSTETH_ROLE");
 
 	/* ------------------------- Pending addresses ----------------------- */
-	address public pendingAdmin;
 	address public pendingRestaker;
 
 	/* -------------------- External contract addresses ------------------ */
@@ -53,6 +56,9 @@ contract RestakeVault is
 
 	/* --------------------------- State vars ---------------------------- */
 	uint256 public claimReserveEthAmt;    // Reserved for queued withdrawals
+
+	/// @notice Portion of wrstETH totalSupply (in %) to always keep in the vault for fast withdrawals
+	uint256 public withdrawReserve; // e.g. 50 means 2% (1/50)
 
 	/* ------------------------------ Events ----------------------------- */
 	event AdminProposed(address oldAdmin, address newAdmin);
@@ -76,18 +82,21 @@ contract RestakeVault is
 		address wrstETHAddr,
 		address wETHAddr
 	) external initializer {
+		__Ownable2Step_init();
 		__AccessControlEnumerable_init();
 		__ReentrancyGuard_init();
 
-		_grantRole(DEFAULT_ADMIN_ROLE, admin);
-		_grantRole(RESTAKER_ROLE,     restaker);
-		_grantRole(ORACLE_ROLE,       oracle);
-		_grantRole(QUEUE_ROLE,        queue);
-		_grantRole(WRSTETH_ROLE,      wrstETHAddr); 
+		_transferOwnership(admin);
+		_grantRole(RESTAKER_ROLE, restaker);
+		_grantRole(ORACLE_ROLE,   oracle);
+		_grantRole(QUEUE_ROLE,    queue);
+		_grantRole(WRSTETH_ROLE,  wrstETHAddr);
 
 		wrstETHToken = IWrstToken(wrstETHAddr);
 		wETH         = IWETH9(wETHAddr);
 		withdrawalQueue = IWithdrawalQueue(queue);
+
+		withdrawReserve = 50; // default: 2% of totalSupply
 	}
 
 	/* ------------------------- Modifiers ------------------------------- */
@@ -98,32 +107,32 @@ contract RestakeVault is
 
 	/* ----------------------- Liquidity outflow ------------------------- */
 	/**
-	 * @notice Move assets to a restaking venue.
-	 * @dev Safety check does not account for ETH pending in wETH.deposit{value:}.
-	 *      In rare cases, after a large queue release, a shortfall may occur.
-	 *      This is not critical, but is logged for monitoring.
-	 * @param ethAmt Amount of ETH to withdraw (in Wei).
+	 * @notice Transfers all available surplus ETH to RESTAKER_ROLE for restaking.
+	 *         Surplus = contract balance minus claimReserveEthAmt minus fast withdrawal reserve.
+	 *         Fast withdrawal reserve = wrstETH.getETHByWrstETH(wrstETH.totalSupply() / withdrawReserve)
+	 *         Reverts if no surplus is available.
 	 */
-	function withdrawForRestaking(uint256 ethAmt)
+	function withdrawForRestaking()
 		external
 		nonReentrant
 		wrstETHNotPaused
 		onlyRole(RESTAKER_ROLE)
 	{
-		uint256 available;
+		uint256 fastReserve = 0;
+		if (withdrawReserve > 0) {
+			uint256 totalSupply = wrstETHToken.totalSupply();
+			uint256 reserveShares = totalSupply / withdrawReserve;
+			fastReserve = wrstETHToken.getETHByWrstETH(reserveShares);
+		}
+		uint256 minBalance = claimReserveEthAmt + fastReserve;
+		uint256 surplus;
 		unchecked {
-			available = address(this).balance > claimReserveEthAmt
-				? address(this).balance - claimReserveEthAmt
+			surplus = address(this).balance > minBalance
+				? address(this).balance - minBalance
 				: 0;
 		}
-		if (available < ethAmt) {
-			emit InsufficientLiquidity(available, claimReserveEthAmt, ethAmt);
-		}
-		require(
-			available >= ethAmt,
-			"Vault: insufficient liquidity"
-		);
-		payable(msg.sender).sendValue(ethAmt);   // reverts on failure
+		require(surplus > 0, "Vault: no surplus to withdraw");
+		payable(msg.sender).sendValue(surplus);
 	}
 
 	/* ----------------------- Liquidity inflow -------------------------- */
@@ -186,31 +195,10 @@ contract RestakeVault is
 
 		emit ClaimReleased(user, ethAmt, wethAmt);
 	}
-
-	/* ------------------------ Role rotation (admin) -------------------- */
-	/* ---------------------- Two-phase: ADMIN --------------------------- */
-	function proposeAdmin(address newAdmin)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
-		require(newAdmin != address(0), "Vault: zero admin");
-		pendingAdmin = newAdmin;
-		emit AdminProposed(getRoleMember(DEFAULT_ADMIN_ROLE, 0), newAdmin);
-	}
-	
-	function acceptAdmin() external {
-		require(msg.sender == pendingAdmin, "Vault: not pending admin");
-		address old = getRoleMember(DEFAULT_ADMIN_ROLE, 0);
-	
-		_grantRole(DEFAULT_ADMIN_ROLE, pendingAdmin);
-		_revokeRole(DEFAULT_ADMIN_ROLE, old);
-	
-		emit AdminChanged(old, pendingAdmin);
-		pendingAdmin = address(0);
-	}
 	
 	/* --------------------- Two-phase: RESTAKER ------------------------- */
 	function proposeRestaker(address newRestaker)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
+		external onlyOwner
 	{
 		require(newRestaker != address(0), "Vault: zero restaker");
 		pendingRestaker = newRestaker;
@@ -229,24 +217,30 @@ contract RestakeVault is
 	}
 
 	/* -------------------- One-step rotations (Oracle / Queue) ---------- */
-	function setOracle(address newOracle)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
+	function setOracle(address newOracle) external onlyOwner {
 		require(newOracle != address(0), "Vault: zero Oracle");
 		address old = getRoleMember(ORACLE_ROLE, 0);
+		_grantRole(ORACLE_ROLE, newOracle);
 		_revokeRole(ORACLE_ROLE, old);
-		_grantRole(ORACLE_ROLE,  newOracle);
 		emit OracleChanged(old, newOracle);
 	}
 
-	function setQueue(address newQueue)
-		external onlyRole(DEFAULT_ADMIN_ROLE)
-	{
+	function setQueue(address newQueue) external onlyOwner {
 		require(newQueue != address(0), "Vault: zero Queue");
 		address old = getRoleMember(QUEUE_ROLE, 0);
+		_grantRole(QUEUE_ROLE, newQueue);
 		_revokeRole(QUEUE_ROLE, old);
-		_grantRole(QUEUE_ROLE,  newQueue);
 		emit QueueChanged(old, newQueue);
+	}
+
+	/**
+	 * @notice Sets the withdrawReserve parameter (portion of wrstETH totalSupply to keep in vault).
+	 * @dev Only callable by owner.
+	 * @param reserveDivisor New divisor (e.g. 50 means 2%).
+	 */
+	function setWithdrawReserve(uint256 reserveDivisor) external onlyOwner {
+		require(reserveDivisor >= 1, "Vault: reserveDivisor must be >= 1");
+		withdrawReserve = reserveDivisor;
 	}
 
 	/* --------------------- Receive plain ETH --------------------------- */
