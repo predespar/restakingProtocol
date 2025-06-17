@@ -15,9 +15,10 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
-interface IRestakeVault {
+interface IEthVault {
 	function reserveForClaims(uint256 ethAmt) external;
 	function depositFromWrstETH(uint256 wethAmt) external;
+	function claimReserveEthAmt() external view returns (uint256);
 }
 
 /* ──────────────── Uniswap Permit2 minimal interface ───────────────── */
@@ -44,12 +45,15 @@ interface IPermit2 {
 	) external;
 }
 
-/// @notice Interface to WithdrawalQueue for orderly ETH withdrawals
-interface IWithdrawalQueue {
-	/// @notice Burn `wrstETH` shares and enqueue withdrawal for `receiver`.
-	/// @return ticketId sequential ID of withdrawal request
-	function requestWithdrawEth(uint256 wrstEthAmt, address receiver, address owner)
-		external returns (uint256 ticketId);
+/// @notice Interface to WithdrawalEthQueue for orderly ETH withdrawals
+interface IEthQueue {
+	function tryWithdraw(
+		uint256 ethShares,
+		address receiver,
+		address owner,
+		uint256 wETHamt
+	) external returns (uint256[4] memory result);
+	function ethQueueUpdate() external;
 }
 
 /**
@@ -77,10 +81,10 @@ contract WrstETH is
 	bytes32 public constant QUEUE_ROLE  = keccak256("QUEUE_ROLE");
 
 	/* ------------------------------ Storage ---------------------------- */
-	IRestakeVault 		public vault;         ///< Restake vault that manages restaking/unrestaking
-	IWETH9        		public wETH;          // < WETH9 token address
-	IWithdrawalQueue    public withdrawalQueue;  // queue contract
-	
+	IEthVault         public ethVault;      ///< ETH vault that manages restaking/unrestaking
+	IWETH9            public wETH;          ///< WETH9 token address
+	IEthQueue  public ethQueue;  ///< WithdrawalEthQueue contract
+
 	/// @notice ETH-per-share conversion rate (wei)
 	uint256 public ethRate;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
 
@@ -88,8 +92,8 @@ contract WrstETH is
 	uint256 public lastRateUpdate;
 
 	/// @notice Daily mint cap (in wrstETH shares)
-	uint256 public dailyMintCapAmt;         ///< 24-hour minting ceiling (in wrstETH)
-	uint256 public todayMintedShares;       ///< Amount of wrstETH shares minted today
+	uint256 public dailyDepositCapAmt;      ///< 24-hour deposit ceiling (in wrstETH)
+	int256  public todayDepositedShares;    ///< Net wrstETH shares deposited today (mint - burn)
 	uint64  public currentDay;              ///< Floor(block.timestamp / 1 day)
 	uint8   public dailyPercent;            ///< Percent of cap allowed per UTC day
 
@@ -174,13 +178,13 @@ contract WrstETH is
 		_grantRole(ORACLE_ROLE, oracle);
 		_grantRole(QUEUE_ROLE, queue);
 
-		vault           = IRestakeVault(vaultAddr);
-		withdrawalQueue = IWithdrawalQueue(queue);
+		ethVault        = IEthVault(vaultAddr);
+		ethQueue        = IEthQueue(queue);
 		wETH            = IWETH9(wETHAddr); 
 		
 		ethRate         = 1e18;                                     // 1:1 initial rate
 		dailyPercent    = _dailyPercent;
-		dailyMintCapAmt = capAmt * dailyPercent / 100;
+		dailyDepositCapAmt = capAmt * dailyPercent / 100;
 		currentDay      = uint64(block.timestamp / 1 days);
 		MAX_ANNUAL_RATE = 1000; // default: 10.00%
 	}
@@ -223,14 +227,15 @@ contract WrstETH is
 		_updateCap(newCapAmt);
 
 		// Re-compute daily limit proportionally to the new cap
-		dailyMintCapAmt = newCapAmt * dailyPercent / 100;
+		dailyDepositCapAmt = newCapAmt * dailyPercent / 100;
+		emit DailyCapChanged(dailyDepositCapAmt);
 	}
 
 	function setDailyPercent(uint8 percent) external onlyOwner {
 		require(percent >= 1 && percent <= 100, "wrstETH: bad %");
 		dailyPercent    = percent;
-		dailyMintCapAmt = cap() * percent / 100;
-		emit DailyCapChanged(dailyMintCapAmt);
+		dailyDepositCapAmt = cap() * percent / 100;
+		emit DailyCapChanged(dailyDepositCapAmt);
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
@@ -321,7 +326,7 @@ contract WrstETH is
 		uint64 today = uint64(block.timestamp / 1 days);
 		if (today > currentDay) {
 			currentDay           = today;
-			todayMintedShares    = 0;
+			todayDepositedShares = 0;
 		}
 
 		// Calculate the total deposit amount (ETH + wETH)
@@ -334,7 +339,9 @@ contract WrstETH is
 		// Cap and daily limit logic
 		if (totalSupply() >= cap()) revert("wrstETH: cap reached");
 		uint256 capRemain = cap() - totalSupply();
-		uint256 dayRemain = dailyMintCapAmt > todayMintedShares ? dailyMintCapAmt - todayMintedShares : 0;
+
+		uint256 usedToday = todayDepositedShares > 0 ? uint256(todayDepositedShares) : 0;
+		uint256 dayRemain = dailyDepositCapAmt + (todayDepositedShares < 0 ? uint256(-todayDepositedShares) : 0) - usedToday;
 		uint256 maxShares = capRemain < dayRemain ? capRemain : dayRemain;
 		if (shares > maxShares) shares = maxShares;
 		require(shares > 0, "wrstETH: daily cap");
@@ -346,7 +353,7 @@ contract WrstETH is
 		refundEthAmt = totalAssetAmt - assetsToRestake;
 
 		// 1. State changes first: mint shares and update counters
-		todayMintedShares += shares;
+		todayDepositedShares += int256(shares);
 		_mint(receiver, shares);
 
 		// 2. Refund logic: prioritize refund in ETH, remainder in wETH
@@ -373,14 +380,14 @@ contract WrstETH is
 		}
 
 		// 3. Transfer wETH to the vault for restaking
-		wETH.safeTransfer(address(vault), assetsToRestake);
-		// The vault will unwrap wETH into ETH upon receiving it. (external)
-		vault.depositFromWrstETH(assetsToRestake);
+		wETH.safeTransfer(address(ethVault), assetsToRestake);
+		// Eth vault will unwrap wETH into ETH upon receiving it. (external)
+		ethVault.depositFromWrstETH(assetsToRestake);
 
 		// try to advance withdrawal queue if there is free liquidity ---
-		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
+		uint256 free = address(ethVault).balance - ethVault.claimReserveEthAmt();
 		if (free > 0) {
-			withdrawalQueue.processEth(free);
+			ethQueue.ethQueueUpdate();
 		}
 
 		emit Deposit(msg.sender, owner, receiver, totalAssetAmt - refundEthAmt, shares);
@@ -562,7 +569,7 @@ contract WrstETH is
 	/**
 	 * @notice Withdraws `assets` from the vault and burns the equivalent shares.
 	 *         Assets will not be returned immediately but will be claimable later
-     *         via `claimEth` in the `WithdrawalQueue` contract.
+	 *         via `claimEth` in the `WithdrawalEthQueue` contract.
 	 * @param assets Amount of assets to withdraw (in Wei).
 	 * @param receiver Address that will receive the withdrawn assets.
 	 * @param owner Address of the owner of the shares being burned.
@@ -591,7 +598,7 @@ contract WrstETH is
 		}
 
 		// Burn the shares and enqueue the withdrawal
-		withdrawalQueue.requestWithdrawEth(shares, receiver, owner);
+		ethQueue.tryWithdraw(shares, receiver, owner, assets);
 
 		// Return the amount of shares burned
 		return shares;
@@ -600,7 +607,7 @@ contract WrstETH is
 	/**
 	 * @notice Redeems `shares` for the equivalent amount of assets.
 	 *         Assets will not be returned immediately but will be claimable
-     *         later via `claimEth` in the `WithdrawalQueue` contract.
+     *         later via `claimEth` in the `WithdrawalEthQueue` contract.
 	 * @param shares Amount of shares to redeem (in Wei).
 	 * @param receiver Address that will receive the redeemed assets.
 	 * @param owner Address of the owner of the shares being redeemed.
@@ -630,7 +637,7 @@ contract WrstETH is
 		}
 
 		// Burn the shares and enqueue the withdrawal
-		withdrawalQueue.requestWithdrawEth(shares, receiver, owner);
+		ethQueue.tryWithdraw(shares, receiver, owner, assets);
 
 		// Return the amount of assets that will be claimable later
 		return assets;
@@ -645,15 +652,11 @@ contract WrstETH is
 	function maxDeposit(address receiver) public view override returns (uint256 maxAssets) {
 		if (paused()) return 0;
 
-		// Reset daily counters if a new UTC day has started
-		uint64 today = uint64(block.timestamp / 1 days);
-		if (today > currentDay) {
-			currentDay           = today;
-			todayMintedShares    = 0;
-		}
-
 		uint256 remainingCap = cap() - totalSupply();
-		uint256 remainingDaily = dailyMintCapAmt > todayMintedShares ? dailyMintCapAmt - todayMintedShares : 0;
+		uint256 usedToday = todayDepositedShares > 0 ? uint256(todayDepositedShares) : 0;
+		uint256 dayRemain = dailyDepositCapAmt + (todayDepositedShares < 0 ? uint256(-todayDepositedShares) : 0) - usedToday;
+
+		uint256 remainingDaily = dailyDepositCapAmt > usedToday ? dayRemain : 0;
 		uint256 minShares = remainingCap < remainingDaily ? remainingCap : remainingDaily;
 		maxAssets = getETHByWrstETH(minShares);
 		
@@ -678,7 +681,15 @@ contract WrstETH is
 		// Discount: user receives ETH as if the rate were reduced by the maximum allowed daily increase
 		ethAmt = previewWithdraw(wrstEthAmt);
 		_burn(owner, wrstEthAmt);
-		vault.reserveForClaims(ethAmt);
+
+		uint64 today = uint64(block.timestamp / 1 days);
+		if (today > currentDay) {
+			currentDay           = today;
+			todayDepositedShares = 0;
+		}
+		todayDepositedShares -= int256(wrstEthAmt);
+		
+		ethVault.reserveForClaims(ethAmt);
 		emit Withdraw(msg.sender, receiver, owner, ethAmt, wrstEthAmt);
 	}
 
@@ -709,7 +720,7 @@ contract WrstETH is
 		uint64 today = uint64(block.timestamp / 1 days);
 		if (today > currentDay) {
 			currentDay           = today;
-			todayMintedShares    = 0;
+			todayDepositedShares = 0;
 		}
 	}
 	
@@ -752,5 +763,21 @@ contract WrstETH is
 		uint16 oldRate = MAX_ANNUAL_RATE;
 		MAX_ANNUAL_RATE = newAnnualRate;
 		emit MaxAnnualRateChanged(oldRate, newAnnualRate);
+	}
+
+	/**
+	 * @notice Allows the WithdrawalEthQueue contract to decrease the ERC20 allowance of a user (owner) to a spender after withdrawal.
+	 *         Can only be called by the contract with QUEUE_ROLE.
+	 * @param owner The address whose wrstETH tokens are being withdrawn and whose allowance is being decreased.
+	 * @param spender The address that was approved by the owner to spend wrstETH (typically msg.sender in the queue).
+	 * @param subtractedValue The amount to subtract from the current allowance (i.e., the amount withdrawn).
+	 */
+	function queueApprove(address owner, address spender, uint256 subtractedValue)
+		external
+		onlyRole(QUEUE_ROLE)
+	{
+		uint256 currentAllowance = allowance(owner, spender);
+		require(currentAllowance >= subtractedValue, "wrstETH: decreased allowance below zero");
+		_approve(owner, spender, currentAllowance - subtractedValue);
 	}
 }
