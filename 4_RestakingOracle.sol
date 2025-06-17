@@ -6,54 +6,40 @@ import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
-interface IWrstOracle {
+interface IWrstETH {
 	function setRate(uint256) external;
 	function resetDailyCounters() external;
-	function paused() external view returns (bool);
-}
-interface IVaultOracle {
-	function claimReserveEthAmt() external view returns (uint256);
-}
-interface IQueueOracle {
-	function processEth(uint256 availableWei) external;
 }
 
 /**
- * @title RestakingOracle
- * @notice Keeper that pushes new price data and releases free liquidity
- *         from the vault into the withdrawal queue.
+ * @title RstEthOracle
+ * @notice Keeper that pushes new price data for wrstETH.
  */
-contract RestakingOracle is Ownable2StepUpgradeable, AccessControlEnumerableUpgradeable {
+contract RstEthOracle is Ownable2StepUpgradeable, AccessControlEnumerableUpgradeable {
 	bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
 
 	/* ------------------------- Pending addresses ----------------------- */
 	address public pendingKeeper;
 
 	/* ------------------------- External links ------------------------- */
-	IWrstOracle  public wrstETHToken;
-	IVaultOracle public vault;
-	IQueueOracle public queue;
+	IWrstETH  public wrstETH;
 
 	/* ---------------------------- Events ------------------------------ */
 	event KeeperProposed(address oldKeeper, address newKeeper);
 	event KeeperChanged(address oldKeeper, address newKeeper);
-	event NewRatePushed(uint256 newRate, uint256 freeToQueue);
+	event NewWrstEthRatePushed(uint256 newWrstEthRate);
 
 	/* ---------------------------- Initializer ------------------------- */
 	/**
-	 * @notice Initializes the RestakingOracle contract.
+	 * @notice Initializes the RstEthOracle contract.
 	 * @param owner_ Address to be set as contract owner.
 	 * @param keeper Address to be granted KEEPER_ROLE.
-	 * @param wrstETHaddr Address of the wrstETH token contract.
-	 * @param vaultAddr Address of the vault contract.
-	 * @param queueAddr Address of the withdrawal queue contract.
+	 * @param wrstEthAddr Address of the wrstETH token contract.
 	 */
 	function initialize(
 		address owner_,
 		address keeper,
-		address wrstETHaddr,
-		address vaultAddr,
-		address queueAddr
+		address wrstEthAddr
 	) external initializer {
 		__Ownable2Step_init();
 		__AccessControlEnumerable_init();
@@ -61,9 +47,7 @@ contract RestakingOracle is Ownable2StepUpgradeable, AccessControlEnumerableUpgr
 		_transferOwnership(owner_);
 		_grantRole(KEEPER_ROLE, keeper);
 
-		wrstETHToken = IWrstOracle(wrstETHaddr);
-		vault        = IVaultOracle(vaultAddr);
-		queue        = IQueueOracle(queueAddr);
+		wrstETH = IWrstETH(wrstEthAddr);
 	}
 
 	/* ----------------------- Two-phase: KEEPER ------------------------ */
@@ -88,25 +72,17 @@ contract RestakingOracle is Ownable2StepUpgradeable, AccessControlEnumerableUpgr
 
 	/* ------------------------- Main keeper job ------------------------ */
 	/**
-	 * @notice Updates the ETH-to-wrstETH conversion rate (ethRate) and releases excess liquidity.
-	 * @param newRate New ETH-to-wrstETH conversion rate.
+	 * @notice Updates the ETH-to-wrstETH conversion rate (ethRate).
+	 * @param newWrstEthRate New ETH-to-wrstETH conversion rate.
 	 */
-	function pushReport(uint256 newRate)
+	function pushReport(uint256 newWrstEthRate)
 		external
 		onlyRole(KEEPER_ROLE)
 	{
 		// Update price and reset daily mint counters
-		wrstETHToken.setRate(newRate);
-		wrstETHToken.resetDailyCounters();
+		wrstETH.setRate(newWrstEthRate);
+		wrstETH.resetDailyCounters();
 
-		// Move all excess liquidity to the withdrawal queue
-		if (wrstETHToken.paused()) return;
-
-		uint256 free = address(vault).balance - vault.claimReserveEthAmt();
-		if (free > 0) {
-			queue.processEth(free);
-		}
-
-		emit NewRatePushed(newRate, free);
+		emit NewWrstEthRatePushed(newWrstEthRate);
 	}
 }
