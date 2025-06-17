@@ -249,7 +249,7 @@ contract EthVault is
 	 */
 	function setWithdrawReserve(uint256 reserveDivisor) external onlyOwner {
 		require(block.timestamp >= lastWithdrawReserveUpdate + 24 hours, "Vault: update too soon");
-		require(reserveDivisor >= 1 && reserveDivisor <= type(uint16).max, "Vault: reserveDivisor must be 1..65535");
+		require(reserveDivisor >= 1 && reserveDivisor <= 10000, "Vault: reserveDivisor must be 1..10000");
 		uint16 oldReserve = withdrawReserve;
 		withdrawReserve = uint16(reserveDivisor);
 		lastWithdrawReserveUpdate = block.timestamp;
