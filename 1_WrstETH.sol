@@ -115,16 +115,7 @@ contract WrstETH is
 	event CapChanged(uint256 oldCapAmt, uint256 newCapAmt);
 	event DailyCapChanged(uint256 newDailyCap);
 	event RateChanged(uint256 oldRate, uint256 newRate);
-	event MaxAnnualRateChanged(uint16 oldRate, uint16 newRate); // <--- добавлено
-
-	event AdminProposed(address oldAdmin, address newAdmin);
-	event AdminChanged(address oldAdmin, address newAdmin);
-	
-	event FreezerProposed(address oldFreezer, address newFreezer);
-	event FreezerChanged(address oldFreezer, address newFreezer);
-	
-	event PauserProposed(address oldPauser, address newPauser);
-	event PauserChanged(address oldPauser, address newPauser);
+	event MaxAnnualRateChanged(uint16 oldRate, uint16 newRate);
 	
 	event OracleChanged(address oldOracle, address newOracle);
 	event QueueChanged(address oldQueue, address newQueue);
