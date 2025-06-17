@@ -10,10 +10,10 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
-interface IWrstToken {
+interface IWrstETH {
 	function paused() external view returns (bool);
 	function totalSupply() external view returns (uint256);
-	function getETHByWrstETH(uint256 wrstEthAmt) external view returns (uint256);
+	function previewWithdraw(uint256 shares) external view returns (uint256);
 }
 
 // --- WETH9 minimal interface ---
@@ -22,16 +22,16 @@ interface IWETH9 is IERC20Upgradeable {
 	function withdraw(uint256) external;
 }
 
-interface IWithdrawalQueue {
+interface IEthQueue {
 	function totalEthReleased() external view returns (uint256);
 	function totalEthOrdered() external view returns (uint256);
 }
 
 /**
- * @title RestakeVault
- * @notice Restaking / un-restaking manager.
+ * @title EthVault
+ * @notice Restaking / un-restaking manager for ETH/wETH.
  */
-contract RestakeVault is
+contract EthVault is
 	Ownable2StepUpgradeable,
 	AccessControlEnumerableUpgradeable,
 	ReentrancyGuardUpgradeable
@@ -41,45 +41,43 @@ contract RestakeVault is
 
 	/* ------------------------------ Roles ------------------------------ */
 	bytes32 public constant RESTAKER_ROLE = keccak256("RESTAKER_ROLE");
-	bytes32 public constant ORACLE_ROLE   = keccak256("ORACLE_ROLE");
 	bytes32 public constant QUEUE_ROLE    = keccak256("QUEUE_ROLE");
-	/// @notice Granted **only** to the wrstETH contract – gate for incoming ETH.
 	bytes32 public constant WRSTETH_ROLE   = keccak256("WRSTETH_ROLE");
 
 	/* ------------------------- Pending addresses ----------------------- */
 	address public pendingRestaker;
 
 	/* -------------------- External contract addresses ------------------ */
-	IWrstToken public wrstETHToken;   ///< wrstETH proxy (for pause checks)
+	IWrstETH public wrstETH;   ///< wrstETH proxy (for pause checks)
 	IWETH9     public wETH; 
-	IWithdrawalQueue public withdrawalQueue;
+	IEthQueue public ethQueue;
 
 	/* --------------------------- State vars ---------------------------- */
 	uint256 public claimReserveEthAmt;    // Reserved for queued withdrawals
 
 	/// @notice Portion of wrstETH totalSupply (in %) to always keep in the vault for fast withdrawals
 	uint16 public withdrawReserve; // e.g. 50 means 2% (1/50)
-	uint256 public lastWithdrawReserveUpdate; // <--- добавлено
+	uint256 public lastWithdrawReserveUpdate;
 
 	/* ------------------------------ Events ----------------------------- */
-	event AdminProposed(address oldAdmin, address newAdmin);
-	event AdminChanged(address oldAdmin, address newAdmin);
-	
-	event RestakerProposed(address oldRestaker, address newRestaker);
-	event RestakerChanged(address oldRestaker, address newRestaker);
+	event EthRestakerProposed(address oldRestaker, address newRestaker);
+	event EthRestakerChanged(address oldRestaker, address newRestaker);
 
-	event OracleChanged(address oldOracle, address newOracle);
-	event QueueChanged(address oldQueue, address newQueue);
-	event WithdrawReserveChanged(uint16 oldReserve, uint16 newReserve); // <--- добавлено
+	event EthQueueChanged(address oldQueue, address newQueue);
+	event EthWithdrawReserveChanged(uint16 oldReserve, uint16 newReserve);
 
-	event InsufficientLiquidity(uint256 available, uint256 reserved, uint256 requested);
-	event ClaimReleased(address user, uint256 ethAmt, uint256 wethAmt, bool instant);
+	event EthClaimReleased(address user, uint256 ethAmt, uint256 wethAmt, bool instant);
+
+	/**
+	 * @notice Emitted when the ETH vault balance changes.
+	 * @param newBalance The current ETH vault balance (see ethVaultBalance()).
+	 */
+	event EthVaultBalance(int256 newBalance);
 
 	/* ------------------------------ Initializer ------------------------ */
 	function initialize(
 		address admin,
 		address restaker,
-		address oracle,
 		address queue,
 		address wrstETHAddr,
 		address wETHAddr
@@ -90,20 +88,19 @@ contract RestakeVault is
 
 		_transferOwnership(admin);
 		_grantRole(RESTAKER_ROLE, restaker);
-		_grantRole(ORACLE_ROLE,   oracle);
 		_grantRole(QUEUE_ROLE,    queue);
 		_grantRole(WRSTETH_ROLE,  wrstETHAddr);
 
-		wrstETHToken = IWrstToken(wrstETHAddr);
+		wrstETH = IWrstETH(wrstETHAddr);
 		wETH         = IWETH9(wETHAddr);
-		withdrawalQueue = IWithdrawalQueue(queue);
+		ethQueue = IEthQueue(queue);
 
 		withdrawReserve = 50; // default: 2% of totalSupply
 	}
 
 	/* ------------------------- Modifiers ------------------------------- */
 	modifier wrstETHNotPaused() {
-		require(!wrstETHToken.paused(), "Vault: wrstETH paused");
+		require(!wrstETH.paused(), "Vault: wrstETH paused");
 		_;
 	}
 
@@ -111,7 +108,7 @@ contract RestakeVault is
 	/**
 	 * @notice Transfers all available surplus ETH to RESTAKER_ROLE for restaking.
 	 *         Surplus = contract balance minus claimReserveEthAmt minus fast withdrawal reserve.
-	 *         Fast withdrawal reserve = wrstETH.getETHByWrstETH(wrstETH.totalSupply() / withdrawReserve)
+	 *         Fast withdrawal reserve = wrstETH.previewWithdraw(wrstETH.totalSupply() / withdrawReserve)
 	 *         Reverts if no surplus is available.
 	 */
 	function withdrawForRestaking()
@@ -122,9 +119,9 @@ contract RestakeVault is
 	{
 		uint256 fastReserve = 0;
 		if (withdrawReserve > 0) {
-			uint256 totalSupply = wrstETHToken.totalSupply();
+			uint256 totalSupply = wrstETH.totalSupply();
 			uint256 reserveShares = totalSupply / withdrawReserve;
-			fastReserve = wrstETHToken.getETHByWrstETH(reserveShares);
+			fastReserve = wrstETH.previewWithdraw(reserveShares);
 		}
 		uint256 minBalance = claimReserveEthAmt + fastReserve;
 		uint256 surplus;
@@ -135,10 +132,17 @@ contract RestakeVault is
 		}
 		require(surplus > 0, "Vault: no surplus to withdraw");
 		payable(msg.sender).sendValue(surplus);
+		emit EthVaultBalance(ethVaultBalance());
 	}
 
 	/* ----------------------- Liquidity inflow -------------------------- */
-	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {}
+	function depositFromRestaker() external payable onlyRole(RESTAKER_ROLE) {
+		// Advance the withdrawal queue if there is free liquidity
+		if (address(this).balance > claimReserveEthAmt) {
+			ethQueue.ethQueueUpdate();
+		}
+		emit EthVaultBalance(ethVaultBalance());
+	}
 	
 	/**
 	 * @notice Accepts wETH deposits from the wrstETH contract.
@@ -153,18 +157,25 @@ contract RestakeVault is
 		require(wethAmt > 0, "Vault: zero wethAmt");
 		// Unwrap wETH into ETH. The resulting ETH will be managed by the vault.
 		wETH.withdraw(wethAmt);
+		// Advance the withdrawal queue if there is free liquidity
+		if (address(this).balance > claimReserveEthAmt) {
+			ethQueue.ethQueueUpdate();
+		}
+		emit EthVaultBalance(ethVaultBalance());
 	}
 
-	/* -------------- Oracle reserve / release management ---------------- */
 	/**
-	 * @notice Reserves ETH for queued withdrawals.
+	 * @notice Reserves ETH for queued withdrawals. Сalled by WrstETH.
 	 * @param ethAmt Amount of ETH to reserve (in Wei).
 	 */
 	function reserveForClaims(uint256 ethAmt)
 		external
 		nonReentrant
 		onlyRole(WRSTETH_ROLE)
-	{ claimReserveEthAmt += ethAmt; }
+	{
+		claimReserveEthAmt += ethAmt;
+		emit EthVaultBalance(ethVaultBalance());
+	}
 
 	/**
 	 * @dev Called by WithdrawalQueue when a user claims ready ETH.
@@ -197,7 +208,8 @@ contract RestakeVault is
 		// Effects: update state after external calls
 		claimReserveEthAmt -= ethAmt + wethAmt;
 
-		emit ClaimReleased(user, ethAmt, wethAmt, instant);
+		emit EthClaimReleased(user, ethAmt, wethAmt, instant);
+		emit EthVaultBalance(ethVaultBalance());
 	}
 	
 	/* --------------------- Two-phase: RESTAKER ------------------------- */
@@ -206,7 +218,7 @@ contract RestakeVault is
 	{
 		require(newRestaker != address(0), "Vault: zero restaker");
 		pendingRestaker = newRestaker;
-		emit RestakerProposed(getRoleMember(RESTAKER_ROLE, 0), newRestaker);
+		emit EthRestakerProposed(getRoleMember(RESTAKER_ROLE, 0), newRestaker);
 	}
 	
 	function acceptRestaker() external {
@@ -216,25 +228,17 @@ contract RestakeVault is
 		_grantRole(RESTAKER_ROLE, pendingRestaker);
 		_revokeRole(RESTAKER_ROLE, old);
 	
-		emit RestakerChanged(old, pendingRestaker);
+		emit EthRestakerChanged(old, pendingRestaker);
 		pendingRestaker = address(0);
 	}
 
-	/* -------------------- One-step rotations (Oracle / Queue) ---------- */
-	function setOracle(address newOracle) external onlyOwner {
-		require(newOracle != address(0), "Vault: zero Oracle");
-		address old = getRoleMember(ORACLE_ROLE, 0);
-		_grantRole(ORACLE_ROLE, newOracle);
-		_revokeRole(ORACLE_ROLE, old);
-		emit OracleChanged(old, newOracle);
-	}
-
+	/* -------------------- One-step rotations (Queue) ---------- */
 	function setQueue(address newQueue) external onlyOwner {
 		require(newQueue != address(0), "Vault: zero Queue");
 		address old = getRoleMember(QUEUE_ROLE, 0);
 		_grantRole(QUEUE_ROLE, newQueue);
 		_revokeRole(QUEUE_ROLE, old);
-		emit QueueChanged(old, newQueue);
+		emit EthQueueChanged(old, newQueue);
 	}
 
 	/**
@@ -249,7 +253,7 @@ contract RestakeVault is
 		uint16 oldReserve = withdrawReserve;
 		withdrawReserve = uint16(reserveDivisor);
 		lastWithdrawReserveUpdate = block.timestamp;
-		emit WithdrawReserveChanged(oldReserve, withdrawReserve);
+		emit EthWithdrawReserveChanged(oldReserve, withdrawReserve);
 	}
 
 	/* --------------------- Receive plain ETH --------------------------- */
@@ -261,26 +265,39 @@ contract RestakeVault is
 	receive() external payable {}
 
 	/**
-	 * @notice Returns the current protocol balance (surplus or deficit) in ETH.
-	 *         balance = WithdrawalQueue.totalEthReleased + address(this).balance - WithdrawalQueue.totalEthOrdered - claimReserveEthAmt
+	 * @notice Returns the current ETH vault balance (surplus or deficit) in ETH.
+	 *         balance = WithdrawalEthQueue.totalEthReleased + address(this).balance
+	 *                  - WithdrawalEthQueue.totalEthOrdered - claimReserveEthAmt
+	 *                  - fast withdrawal reserve
 	 *         If balance > 0: surplus (can be restaked).
 	 *         If balance < 0: deficit (should be withdrawn from restaking).
 	 *         Invariant: released should never exceed ordered, but if it does, result may be incorrect.
 	 * @return balanceWei Signed integer: positive = surplus, negative = deficit.
 	 */
-	function getProtocolBalance() external view returns (int256 balanceWei) {
-		uint256 released = withdrawalQueue.totalEthReleased();
-		uint256 ordered = withdrawalQueue.totalEthOrdered();
+	function ethVaultBalance() public view returns (int256) {
+		uint256 released = ethQueue.totalEthReleased();
+		uint256 ordered = ethQueue.totalEthOrdered();
 		uint256 onContract = address(this).balance;
 		uint256 reserved = claimReserveEthAmt;
 
+		// Calculate fast withdrawal reserve
+		uint256 fastReserve = 0;
+		if (withdrawReserve > 0) {
+			uint256 totalSupply = wrstETH.totalSupply();
+			uint256 reserveShares = totalSupply / withdrawReserve;
+			fastReserve = wrstETH.previewWithdraw(reserveShares);
+		}
+
 		// Defensive: released should not exceed ordered, but if it does, cap at ordered
-		// Convert to int256 for correct sign handling
 		if (released > ordered) {
 			released = ordered;
 		}
 
-		balanceWei = int256(released) + int256(onContract) - int256(ordered) - int256(reserved);
+		int256 balanceWei = int256(released)
+			+ int256(onContract)
+			- int256(ordered)
+			- int256(reserved)
+			- int256(fastReserve);
 		return balanceWei;
 	}
 }
