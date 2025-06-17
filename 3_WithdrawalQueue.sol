@@ -230,14 +230,29 @@ contract WithdrawalEthQueue is
 	}
 
 	/**
-	 * @notice Returns the claim status for a withdrawal ticket.
+	 * @notice Returns the state of a withdrawal order.
+	 * @dev
+	 * - The first return value (`released`) is true if the given id is less than or equal to the current queue top (`totalEthReleased`),
+	 *   i.e. all ids <= totalEthReleased are considered released and can be claimed if they exist and have not been claimed yet.
+	 *   This value does not depend on whether the id exists or was already claimed.
+	 * - The second return value (`exists`) is true if the order with this id exists and has not yet been claimed.
+	 *   This is independent of the queue top.
+	 *
+	 * Possible states:
+	 * | released | exists | Meaning                                         |
+	 * |----------|--------|-------------------------------------------------|
+	 * | false    | true   | In queue, not yet released                      |
+	 * | true     | true   | Ready to claim                                  |
+	 * | false    | false  | Not ready, doesn't exist                        |
+	 * | true     | false  | Ready, doesn't exist or already claimed         |
+	 *
 	 * @param id NFT ticket id.
-	 * @return ready True if claim can be called for this id (id released and not yet claimed).
-	 * @return alreadyClaimed True if the claim was already processed (id released and already claimed).
+	 * @return released True if id <= totalEthReleased (can be claimed if exists and not claimed).
+	 * @return exists True if the order exists and was not yet claimed.
 	 */
-	function isClaimReady(uint256 id) external view returns (bool ready, bool alreadyClaimed) {
-		bool released = id <= totalEthReleased;
-		bool exists = ethOrders[id] > 0;
+	function getOrderState(uint256 id) external view returns (bool released, bool exists) {
+		released = id <= totalEthReleased;
+		exists = ethOrders[id] > 0;
 		return (released, exists);
 	}
 }
