@@ -12,6 +12,7 @@
 - All transfers and operations are blocked for frozen accounts.
 - Emits events on all critical parameter changes.
 - Daily deposit cap is enforced as a net of minted and burned shares per day (`todayDepositedShares`).
+- **Integrated with PointsController:** On every token transfer, points are accrued and settled for both sender and receiver via `settleBefore` and `settleAfter` hooks.
 
 ### 2. EthVault
 - Manages ETH reserves for the withdrawal queue and restaking operations.
@@ -42,6 +43,16 @@
 - `KEEPER_ROLE` rotation is two-step (propose/accept).
 - All calls are strictly role-restricted.
 - Emits `NewWrstEthRatePushed` on each report.
+- **Feeds daily rates to PointsController and updates points accumulators using Chainlink price feeds.**
+
+### 5. PointsController
+- Tracks global `accPointsPerShare[token]` indices and manages user points for all wrstX tokens.
+- Points are NOT ERC-20 and are non-transferable.
+- Points are accrued daily by the Oracle and on every wrstX token transfer via `settleBefore` and `settleAfter`.
+- In claim phase, users can claim or claimAndStake their points for WRST/sWRST.
+- Only wrstX tokens and Oracle can interact with accrual/settlement functions.
+- All roles and access rights implemented via OpenZeppelin `AccessControlUpgradeable`.
+- Fully upgradeable and pausable.
 
 ## Security & Optimization
 
@@ -59,4 +70,4 @@
 - Support for both off-chain and on-chain NFT metadata.
 - Integration with external services (e.g., Uniswap Permit2, OpenSea) is possible.
 - All key protocol state changes are reflected in events for off-chain monitoring and integrations.
-
+- **On-chain points accrual and claim logic for airdrop and rewards.**
