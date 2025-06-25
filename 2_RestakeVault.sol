@@ -10,7 +10,7 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
-interface IWrstETH {
+interface IWrstX {
 	function paused() external view returns (bool);
 	function totalSupply() external view returns (uint256);
 	function previewWithdraw(uint256 shares) external view returns (uint256);
@@ -48,7 +48,7 @@ contract EthVault is
 	address public pendingRestaker;
 
 	/* -------------------- External contract addresses ------------------ */
-	IWrstETH public wrstETH;   ///< wrstETH proxy (for pause checks)
+	IWrstX public wrstETH;   ///< wrstETH proxy (for pause checks)
 	IWETH9     public wETH; 
 	IEthQueue public ethQueue;
 
@@ -64,6 +64,7 @@ contract EthVault is
 	event EthRestakerChanged(address oldRestaker, address newRestaker);
 
 	event EthQueueChanged(address oldQueue, address newQueue);
+	event WrstETHChanged(address oldWrstETH, address newWrstETH);
 	event EthWithdrawReserveChanged(uint16 oldReserve, uint16 newReserve);
 
 	event EthClaimReleased(address user, uint256 ethAmt, uint256 wethAmt, bool instant);
@@ -91,7 +92,7 @@ contract EthVault is
 		_grantRole(QUEUE_ROLE,    queue);
 		_grantRole(WRSTETH_ROLE,  wrstETHAddr);
 
-		wrstETH = IWrstETH(wrstETHAddr);
+		wrstETH = IWrstX(wrstETHAddr);
 		wETH         = IWETH9(wETHAddr);
 		ethQueue = IEthQueue(queue);
 
@@ -232,13 +233,22 @@ contract EthVault is
 		pendingRestaker = address(0);
 	}
 
-	/* -------------------- One-step rotations (Queue) ---------- */
+	/* -------------------- One-step rotations (Queue, wrstETH) ---------- */
 	function setQueue(address newQueue) external onlyOwner {
 		require(newQueue != address(0), "Vault: zero Queue");
 		address old = getRoleMember(QUEUE_ROLE, 0);
 		_grantRole(QUEUE_ROLE, newQueue);
 		_revokeRole(QUEUE_ROLE, old);
 		emit EthQueueChanged(old, newQueue);
+	}
+
+	function setWrstETH(address newWrstETH) external onlyOwner {
+		require(newWrstETH != address(0), "Vault: zero wrstETH");
+		address old = getRoleMember(WRSTETH_ROLE, 0);
+		_grantRole(WRSTETH_ROLE, newWrstETH);
+		_revokeRole(WRSTETH_ROLE, old);
+		wrstETH = IWrstX(newWrstETH);
+		emit WrstETHChanged(old, newWrstETH);
 	}
 
 	/**
