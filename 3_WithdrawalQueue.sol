@@ -7,7 +7,7 @@ import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
 /* ──────────────────────────── External interfaces ─────────────────────────── */
-interface IWrstETH {
+interface IWrstX {
 	function burnForWithdrawal(uint256,address,address) external returns (uint256);
 	function paused() external view returns (bool);
 	function isFrozen(address) external view returns (bool);
@@ -30,7 +30,7 @@ contract WithdrawalEthQueue is
 	ReentrancyGuardUpgradeable
 {
 	/* ------------------------- External links ------------------------- */
-	IWrstETH	public wrstETH;
+	IWrstX	public wrstETH;
 	IEthVault	public ethVault;
 
 	/* ----------------------- ETH-specific state ----------------------- */
@@ -53,6 +53,8 @@ contract WithdrawalEthQueue is
 	 * @param pendingAmount The remaining amount of ETH pending in the queue.
 	 */
 	event QueueAdvanced(uint256 newQueueTop, uint256 pendingAmount);
+	event EthVaultChanged(address oldVault, address newVault);
+	event WrstETHChanged(address oldWrstETH, address newWrstETH);
 
 	/* ---------------------------- Initializer ------------------------- */
 	function initialize(
@@ -66,7 +68,7 @@ contract WithdrawalEthQueue is
 
 		_transferOwnership(admin);
 
-		wrstETH  = IWrstETH(wrstEthAddr);
+		wrstETH  = IWrstX(wrstEthAddr);
 		ethVault = IEthVault(ethVaultAddr);
 	}
 
@@ -254,5 +256,28 @@ contract WithdrawalEthQueue is
 		released = id <= totalEthReleased;
 		exists = ethOrders[id] > 0;
 		return (released, exists);
+	}
+
+	/* ---------------------------- Admin functions ---------------------------- */
+	/**
+	 * @notice Sets a new wrstETH contract address.
+	 * @param wrstEthAddr Address of the new wrstETH contract.
+	 */
+	function setWrstETH(address wrstEthAddr) external onlyOwner {
+		require(wrstEthAddr != address(0), "WithdrawalEthQueue: zero wrstETH");
+		address old = address(wrstETH);
+		wrstETH = IWrstX(wrstEthAddr);
+		emit WrstETHChanged(old, wrstEthAddr);
+	}
+
+	/**
+	 * @notice Sets a new EthVault contract address.
+	 * @param vaultAddr Address of the new EthVault contract.
+	 */
+	function setEthVault(address vaultAddr) external onlyOwner {
+		require(vaultAddr != address(0), "WithdrawalEthQueue: zero vault");
+		address old = address(ethVault);
+		ethVault = IEthVault(vaultAddr);
+		emit EthVaultChanged(old, vaultAddr);
 	}
 }
