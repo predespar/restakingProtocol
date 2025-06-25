@@ -21,6 +21,11 @@ interface IEthVault {
 	function claimReserveEthAmt() external view returns (uint256);
 }
 
+interface IPointsController {
+    function settleBefore(address token, address user) external;
+    function settleAfter(address  token, address user) external;
+}
+
 /* ──────────────── Uniswap Permit2 minimal interface ───────────────── */
 interface IWETH9 is IERC20Upgradeable {
 	function deposit() external payable;
@@ -82,8 +87,9 @@ contract WrstETH is
 
 	/* ------------------------------ Storage ---------------------------- */
 	IEthVault         public ethVault;      ///< ETH vault that manages restaking/unrestaking
+	IPointsController public points;		///< Points controller for wrstETH shares
 	IWETH9            public wETH;          ///< WETH9 token address
-	IEthQueue  public ethQueue;  ///< WithdrawalEthQueue contract
+	IEthQueue		  public ethQueue;		///< WithdrawalEthQueue contract
 
 	/// @notice ETH-per-share conversion rate (wei)
 	uint256 public ethRate;       ///< How many wei of ETH per 1 wrstETH (18 decimals)
@@ -118,7 +124,9 @@ contract WrstETH is
 	event MaxAnnualRateChanged(uint16 oldRate, uint16 newRate);
 	
 	event OracleChanged(address oldOracle, address newOracle);
-	event QueueChanged(address oldQueue, address newQueue);
+	event EthQueueChanged(address oldQueue, address newQueue);
+	event PointsControllerChanged(address oldController, address newController);
+	event EthVaultChanged(address oldVault, address newVault);
 	
 	event Deposit(
 		address caller,
@@ -230,7 +238,7 @@ contract WrstETH is
 	}
 
 	/* ------------------------ Role rotation (admin) -------------------- */
-	/* ---------------- One-step rotation: ORACLE & QUEUE ---------------- */
+	/* --------- One-step rotation: ORACLE, QUEUE, POINTS, VAULT --------- */
 	function setOracle(address newOracle)
 		external onlyOwner
 	{
@@ -248,7 +256,21 @@ contract WrstETH is
 		address old = getRoleMember(QUEUE_ROLE, 0);
 		_grantRole(QUEUE_ROLE, newQueue);
 		_revokeRole(QUEUE_ROLE, old);
-		emit QueueChanged(old, newQueue);
+		emit EthQueueChanged(old, newQueue);
+	}
+
+	function setEthVault(address vaultAddr) external onlyOwner {
+		require(vaultAddr != address(0), "wrstETH: zero vault");
+		address old = address(ethVault);
+		ethVault = IEthVault(vaultAddr);
+		emit EthVaultChanged(old, vaultAddr);
+	}
+
+	function setPointsController(address controller) external onlyOwner {
+		require(controller != address(0), "wrstETH: zero controller");
+		address old = address(points);
+		points = IPointsController(controller);
+		emit PointsControllerChanged(old, controller);
 	}
 
 	/* --------------------------- Math helpers -------------------------- */
@@ -282,14 +304,30 @@ contract WrstETH is
 		return shares * (ethRate - discount) / 1e18;
 	}
 
-	/* --------------------- Transfer guard overrides -------------------- */
+	/* --------------------- Transfer guard overrides и учёт поинтов -------------------- */
 	function _beforeTokenTransfer(address from, address to, uint256 amount)
 		internal override
 	{
 		require(!paused(), "wrstETH: paused");
 		require(!_frozen[from], "wrstETH: from is frozen");
 		require(!_frozen[to], "wrstETH: to is frozen");
+
+		if (address(points) != address(0)) {
+			if (from != address(0)) points.settleBefore(address(this), from);
+			if (to   != address(0)) points.settleBefore(address(this), to);
+		}
+
 		super._beforeTokenTransfer(from, to, amount);
+	}
+
+	function _afterTokenTransfer(address from, address to, uint256)
+		internal override
+	{
+		if (address(points) != address(0)) {
+			if (from != address(0)) points.settleAfter(address(this), from);
+			if (to   != address(0)) points.settleAfter(address(this), to);
+		}
+		super._afterTokenTransfer(from, to, 0);
 	}
 
 	/* --------------------- Core deposit routine ------------------------ */
